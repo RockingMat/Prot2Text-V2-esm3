@@ -1,0 +1,9 @@
+__pycache__
+*.csv
+*.err
+*.log
+*.ipynb
+*.pt
+*.pth
+*tmp*
+.vscode
