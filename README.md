@@ -2,8 +2,6 @@
 
 Code repository for paper: *Prot2Text-V2: Protein Function Prediction with Multimodal Contrastive Alignment*. 
 
-Submitted to 39th Conference on Neural Information Processing Systems (NeurIPS 2025).
-
 ## Overview
 
 ![Model Architecture](./figures/model.png)
