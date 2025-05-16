@@ -1,7 +1,5 @@
 """
 Utilities for `model/pdb2nx.py` script.
-This file is modified from prot2text_dataset.conversion.py of Prot2Text project.
-Code repository: https://github.com/hadi-abdine/Prot2Text/blob/master/prot2text_dataset/conversion.py
 """
 import numpy as np
 from biopandas.pdb import PandasPdb

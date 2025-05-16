@@ -1,7 +1,5 @@
 """
 Functions for working with Protein Structure Graphs.
-This file is modified from prot2text_dataset.graphs.py of Prot2Text project.
-Code repository: https://github.com/hadi-abdine/Prot2Text/blob/master/prot2text_dataset/graphs.py
 """
 import logging
 from typing import Callable, List, Literal, Optional

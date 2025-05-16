@@ -1,7 +1,5 @@
 """
 Functions for converting Protein Structure Graphs to standard Data object.
-This file is modified from prot2text_dataset.pdb2graph.py of Prot2Text project.
-Code repository: https://github.com/hadi-abdine/Prot2Text/blob/master/prot2text_dataset/pdb2graph.py
 """
 import networkx as nx
 import numpy as np
