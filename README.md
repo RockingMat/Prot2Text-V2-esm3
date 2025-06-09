@@ -113,15 +113,9 @@ The repository also includes a legacy base model, `Esm2LlamaForCausalLM`, which 
 
 ## Dataset Preparation
 
-* Download CSV files from cloud and place under `./data`: 
+* Download CSV files from [HuggingFace](https://huggingface.co/datasets/habdine/Prot2Text-Data) and place under `./data`.  
 
-|  Dataset   |  Size   |     Link     |
-|:----------:|:-------:|:------------:|
-|   Train    | 248 315 | [Download](https://1drv.ms/u/s!AhcBGHWGY2mukdJswGT00GA0GnGjkA?e=VVf5xv) | 
-| Evaluation |  4 172  | [Download](https://1drv.ms/u/s!AhcBGHWGY2mukdJtAemPRrPipxX-tg?e=IHvJYd) | 
-|    Test    |  4 203  | [Download](https://1drv.ms/u/s!AhcBGHWGY2mukdJrPdyteHb4LX3HjA?e=SH3UUa) |
-
-* Download PDB files from AlphaFoldDB then preprocess graph and text features: 
+* Download PDB files from AlphaFoldDB (for RGCN only) then preprocess graph and text features: 
 
 ```python
 from transformers import AutoTokenizer
