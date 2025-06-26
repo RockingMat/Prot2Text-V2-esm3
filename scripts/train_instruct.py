@@ -35,13 +35,14 @@ from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer
-from transformers import EsmModel, LlamaForCausalLM
+from transformers import LlamaForCausalLM
+import esm
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
-    Esm2LlamaInstructForCausalLM
+    ESM3LlamaInstructForCausalLM
 )
 import scripts.utils_argparse as utils_argparse
 
@@ -85,12 +86,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     Load base model of the given name, and load weights from the checkpoint path 
     if provided.
     """
-    esm_encoder = EsmModel.from_pretrained(
-        args["esm_path"], 
-        add_pooling_layer=False,
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
-    )
+    esm_encoder, _ = esm.pretrained.esm3_sm_open_v1()
     llama_decoder = LlamaForCausalLM.from_pretrained(
         args["llama_path"], 
         torch_dtype=args["torch_dtype"], 
@@ -105,7 +101,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
     
-    model = Esm2LlamaInstructForCausalLM(
+    model = ESM3LlamaInstructForCausalLM(
         esm_encoder=esm_encoder,
         adapter=adapter,
         llama_decoder=llama_decoder,

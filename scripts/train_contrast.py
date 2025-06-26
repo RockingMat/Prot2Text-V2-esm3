@@ -32,13 +32,14 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedModel
-from transformers import EsmModel, LlamaModel, LlamaForCausalLM
+from transformers import LlamaModel, LlamaForCausalLM
+import esm
 
 from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
-    Esm2LlamaInstructForCausalLM
+    ESM3LlamaInstructForCausalLM
 )
 import scripts.utils_argparse as utils_argparse
 
@@ -125,12 +126,7 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     A general checkpoint shall contain the model state dict, optimizer state dict,
     and scheduler state dict.
     """
-    esm_encoder = EsmModel.from_pretrained(
-        args["esm_path"], 
-        add_pooling_layer=False,
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
-    )
+    esm_encoder, _ = esm.pretrained.esm3_sm_open_v1()
     llama_decoder = LlamaForCausalLM.from_pretrained(
         args["llama_path"], 
         torch_dtype=args["torch_dtype"], 
@@ -145,7 +141,7 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
     
-    model = Esm2LlamaInstructForCausalLM(
+    model = ESM3LlamaInstructForCausalLM(
         esm_encoder=esm_encoder,
         adapter=adapter,
         llama_decoder=llama_decoder,
