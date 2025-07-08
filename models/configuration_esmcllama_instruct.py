@@ -6,5 +6,5 @@ from .configuration_esm2llama_instruct import (
 
 
 @dataclass
-class ESMCLlamaInstructConfig(Esm2LlamaInstructConfig):
+class ESMCLLMConfig(Esm2LlamaInstructConfig):
     model_type = "esmC_llama_instruct"
