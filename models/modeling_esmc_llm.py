@@ -38,11 +38,14 @@ class ESMCambrianLLMInstructForCausalLM(PreTrainedModel):
         
         super().__init__(config)
 
-        # ESM Cambrian encoder - load directly without tokenizer wrapper
+        # ESM Cambrian encoder - use ESM++ implementation with built-in tokenizer
         self.esm_encoder = AutoModelForMaskedLM.from_pretrained(
-            "EvolutionaryScale/esmc-600m-2024-12",
+            "Synthyra/ESMplusplus_large",  # ESM++ provides HuggingFace compatibility
             trust_remote_code=True
         )
+        
+        # ESM++ provides a built-in tokenizer
+        self.esm_tokenizer = self.esm_encoder.tokenizer
         
         # LLM decoder (default: Qwen-14B)
         model_name = getattr(config, 'llm_model_name', 'qwen/Qwen-14B')

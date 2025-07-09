@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizer
+from transformers import AutoTokenizer, AutoModelForMaskedLM, PreTrainedTokenizer
 
 from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
 from .train_instruct import load_model, setup, cleanup
@@ -148,7 +148,12 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     setup(rank, world_size)
 
     # prepare dataset and dataloader
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
+    # Use ESM++ tokenizer for compatibility with ESM Cambrian model
+    esm_model = AutoModelForMaskedLM.from_pretrained(
+        "Synthyra/ESMplusplus_large", 
+        trust_remote_code=True
+    )
+    esm_tokenizer = esm_model.tokenizer
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"], 
         pad_token='<|reserved_special_token_0|>'

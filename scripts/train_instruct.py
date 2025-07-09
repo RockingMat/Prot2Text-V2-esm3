@@ -34,22 +34,18 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer
-from transformers import LlamaForCausalLM
-import esm
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
+
+from models.configuration_esmc_llm import ESMCLLMConfig, ModalityAdapterConfig
+from models.modeling_esmc_llm import ESMCambrianLLMInstructForCausalLM
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
-from models import (
-    ModalityAdapter, 
-    ModalityAdapterConfig, 
-    ESM3LlamaInstructForCausalLM
-)
 import scripts.utils_argparse as utils_argparse
 
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
+argParser.add_argument("--esm_path", type=str, help="[DEPRECATED] ESM path - now using fixed Synthyra/ESMplusplus_large")
 argParser.add_argument("--llama_path", type=str)
 # argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -69,6 +65,7 @@ argParser.add_argument("--scheduler_gamma", type=float)
 argParser.add_argument("--random_seed", type=int)
 argParser.add_argument("--fix_modality_adapter", type=utils_argparse.str2bool)
 argParser.add_argument("--lora_rank", type=int)
+argParser.add_argument("--adapter_intermediate_dim", type=int, default=2048, help="Intermediate dimension for the modality adapter")
 
 argParser.add_argument("--include_text_fields", type=utils_argparse.str2bool)
 argParser.add_argument("--name_dropout", type=float)
@@ -80,74 +77,93 @@ argParser.add_argument("--debug_trim_train_split", type=int, default=None)
 argParser.add_argument("--debug_trim_eval_split", type=int, default=None)
 
 
+def create_model_config(args: Dict[str, Any]) -> ESMCLLMConfig:
+    """Create and validate model configuration."""
+    config = ESMCLLMConfig(
+        llm_model_name = args.get("llm_model_name", "qwen/Qwen-14B"),
+        adapter_config = ModalityAdapterConfig(
+            input_dim       = 0,  # set dynamically from ESM encoder hidden size
+            intermediate_dim= args.get("adapter_intermediate_dim", 2048),
+            output_dim      = 0,  # set dynamically from LLM decoder hidden size
+        )
+    )
+    
+    # Validate intermediate dimension
+    if config.adapter_config.intermediate_dim <= 0:
+        raise ValueError(f"adapter_intermediate_dim must be positive, got {config.adapter_config.intermediate_dim}")
+    
+    return config
+
+
 def load_model(args: Dict[str, Any]) -> PeftModel:
     """
     Standard API for different models. Used in both `train` and `generate`.
-    Load base model of the given name, and load weights from the checkpoint path 
-    if provided.
+    Loads the Prot2Text pipeline class (ESM Cambrian encoder + adapter +
+    any HF CausalLM, defaulting to Qwen-14B), then wraps it with LoRA.
+
+    Returned model is on CPU under the default dtype.
     """
-    esm_encoder, _ = esm.pretrained.esm3_sm_open_v1()
-    llama_decoder = LlamaForCausalLM.from_pretrained(
-        args["llama_path"], 
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+    # 1) Build our config (specify LLM and adapter size)
+    config = create_model_config(args)
+
+    # 2) (Optional) Preload a custom LLM decoder on CPU
+    llm_decoder = None
+    llm_path = args.get("llm_decoder_path") or args.get("llama_path")
+    if llm_path:
+        llm_decoder = AutoModelForCausalLM.from_pretrained(
+            llm_path,
+            torch_dtype = args["torch_dtype"],
+            device_map  = "cpu",
+            trust_remote_code = True,
         )
 
-    adapter_config = ModalityAdapterConfig(
-        input_dim=esm_encoder.config.hidden_size,
-        intermediate_dim=2048,
-        output_dim=llama_decoder.config.hidden_size,
+    # 3) Instantiate the full model (ESM Cambrian + adapter + LLM)
+    model = ESMCambrianLLMInstructForCausalLM(
+        config      = config,
+        llm_decoder = llm_decoder,  # if None, class loads from config.llm_model_name
     )
-    adapter = ModalityAdapter(adapter_config)
-    adapter.to(args["torch_dtype"])
-    
-    model = ESM3LlamaInstructForCausalLM(
-        esm_encoder=esm_encoder,
-        adapter=adapter,
-        llama_decoder=llama_decoder,
-    )
+    # 4) (Optional) Load state dict for the base pipeline
+    ckpt = args.get("load_model_checkpoint_path")
+    if ckpt:
+        print(f"Loading base checkpoint from {ckpt}")
+        state_dict = torch.load(ckpt, map_location="cpu")
+        model.load_state_dict(state_dict, strict=False)
 
-    # overwrite weights of base model if checkpoint path is provided
-    if args["load_model_checkpoint_path"]:
-        print(f"Loading {args['load_model_checkpoint_path']}")
-        model_state_dict = torch.load(
-            args["load_model_checkpoint_path"], 
-            weights_only=True, 
-            map_location="cpu"  # load to CPU first
-            # will be loaded to where the weights were saved from if not specified
-        )
-        model.load_state_dict(model_state_dict)
+    # 5) Freeze base encoder & decoder weights
+    model.esm_encoder.requires_grad_(False)
+    model.llm_decoder.requires_grad_(False)
 
-    # wrap by lora either with pretrained adapter or with initialized adapter
-    if args["load_adapter_checkpoint_dir"]:
-        print(f"Loading {args['load_adapter_checkpoint_dir']}")
+    # 6) Wrap with LoRA
+    adapter_ckpt = args.get("load_adapter_checkpoint_dir")
+    if adapter_ckpt:
+        print(f"Loading LoRA adapter from {adapter_ckpt}")
         model = PeftModel.from_pretrained(
-            model, 
-            args["load_adapter_checkpoint_dir"], 
+            model,
+            adapter_ckpt,
             is_trainable=True
         )
-    else: 
-        print("Initializing LoRA adapter")
+    else:
+        print("Initializing new LoRA adapter")
         lora_config = LoraConfig(
-            r=args["lora_rank"], 
-            lora_alpha=args["lora_rank"] * 2, 
-            lora_dropout=0.1,
-            bias="none", 
-            init_lora_weights=True, 
-            target_modules=[
-                "self_attn.q_proj", 
-                "self_attn.k_proj", 
-                "self_attn.v_proj", 
-                "self_attn.o_proj", 
-                "mlp.gate_proj", 
-                "mlp.up_proj", 
-                "mlp.down_proj"
-            ],  # for llama_decoder 
-            modules_to_save=(
-                ["adapter.fc1", "adapter.fc2"] 
-                if not args["fix_modality_adapter"] 
+            r               = args["lora_rank"],
+            lora_alpha      = args["lora_rank"] * 2,
+            lora_dropout    = args.get("lora_dropout", 0.1),
+            bias            = "none",
+            init_lora_weights = True,
+            target_modules  = [
+                "self_attn.q_proj",
+                "self_attn.k_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.up_proj",
+                "mlp.down_proj",
+            ],
+            modules_to_save = (
+                ["adapter.fc1", "adapter.fc2"]
+                if not args.get("fix_modality_adapter", False)
                 else None
-            )
+            ),
         )
         model = get_peft_model(model, lora_config)
 
@@ -325,7 +341,12 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
+    # Use ESM++ tokenizer for consistency with ESMCambrianLLMInstructForCausalLM model
+    esm_model = AutoModelForMaskedLM.from_pretrained(
+        "Synthyra/ESMplusplus_large", 
+        trust_remote_code=True
+    )
+    esm_tokenizer = esm_model.tokenizer
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"], 
         pad_token='<|reserved_special_token_0|>'

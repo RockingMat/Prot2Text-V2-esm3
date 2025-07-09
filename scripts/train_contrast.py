@@ -12,7 +12,17 @@ inter-epoch evaluation.
 The script currently does not support save/load pretrained, gradient checkpointing 
 or generation under FSDP. 
 
-reference for AMP: https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html 
+reference for AMP: https://pytorch.org/tutorials/recipes/recipes/    # prepare dataset and dataloader
+    # Use ESM++ tokenizer for compatibility with ESM Cambrian model
+    esm_model = AutoModelForMaskedLM.from_pretrained(
+        "Synthyra/ESMplusplus_large", 
+        trust_remote_code=True
+    )
+    esm_tokenizer = esm_model.tokenizer
+    llama_tokenizer = AutoTokenizer.from_pretrained(
+        args["llama_path"], 
+        pad_token='<|reserved_special_token_0|>'
+    )cipe.html 
 
 * The script is designed for multi-GPU parallelism on single node.
 * On the cluster, print(...) will go to stdout and tqdm(...) will go to stderr.
@@ -31,22 +41,17 @@ from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, PreTrainedModel
-from transformers import LlamaModel, LlamaForCausalLM
-import esm
+from transformers import AutoTokenizer, AutoModelForMaskedLM, LlamaModel, AutoModelForCausalLM
 
 from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
-from models import (
-    ModalityAdapter, 
-    ModalityAdapterConfig, 
-    ESM3LlamaInstructForCausalLM
-)
+from models.configuration_esmc_llm import ESMCLLMConfig, ModalityAdapterConfig
+from models.modeling_esmc_llm import ESMCambrianLLMInstructForCausalLM
 import scripts.utils_argparse as utils_argparse
 
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
+argParser.add_argument("--esm_path", type=str, help="[DEPRECATED] ESM path - now using fixed Synthyra/ESMplusplus_large")
 argParser.add_argument("--llama_path", type=str)
 argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -116,50 +121,51 @@ class SegmentedBatchInfoNCELoss(torch.nn.Module):
         return - torch.log(numerator / denominator).mean()
 
 
-def load_model(args: Dict[str, Any]) -> PreTrainedModel:
+def load_model(args: Dict[str, Any]) -> ESMCambrianLLMInstructForCausalLM:
     """
     Standard API for different models. Used in both `train` and `generate`.
-    Load base model of the given name, and load weights from the checkpoint path 
-    if provided.
-
-    Returned model should be on CPU and under default data type.
-    A general checkpoint shall contain the model state dict, optimizer state dict,
-    and scheduler state dict.
+    Loads the Prot2Text model class with ESM Cambrian encoder + adapter +
+    any HF CausalLM (default: Qwen-14B). Pulls weights from the Hub or from 
+    `llm_decoder_path`, and then applies a checkpoint if provided.
+    Returned model is on CPU under the default dtype.
     """
-    esm_encoder, _ = esm.pretrained.esm3_sm_open_v1()
-    llama_decoder = LlamaForCausalLM.from_pretrained(
-        args["llama_path"], 
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+    # 1) Build our config, specifying which LLM to use and adapter size:
+    config = ESMCLLMConfig(
+        llm_model_name=args.get("llm_model_name", "qwen/Qwen-14B"),
+        adapter_config=ModalityAdapterConfig(
+            # input_dim/output_dim will be set internally in __init__
+            input_dim=0,
+            intermediate_dim=args.get("adapter_intermediate_dim", 2048),
+            output_dim=0,
         )
-
-    adapter_config = ModalityAdapterConfig(
-        input_dim=esm_encoder.config.hidden_size,
-        intermediate_dim=2048,
-        output_dim=llama_decoder.config.hidden_size,
-    )
-    adapter = ModalityAdapter(adapter_config)
-    adapter.to(args["torch_dtype"])
-    
-    model = ESM3LlamaInstructForCausalLM(
-        esm_encoder=esm_encoder,
-        adapter=adapter,
-        llama_decoder=llama_decoder,
     )
 
-    if args["load_model_checkpoint_path"]:
-        print(f"Loading {args['load_model_checkpoint_path']}")
-        model_state_dict = torch.load(
-            args["load_model_checkpoint_path"], 
-            weights_only=True, 
-            map_location="cpu"  # load to CPU first
-            # will be loaded to where the weights were saved from if not specified
+    # 2) (Optional) Preload a custom LLM decoder on CPU
+    llm_decoder = None
+    llm_path = args.get("llm_decoder_path")
+    if llm_path:
+        llm_decoder = AutoModelForCausalLM.from_pretrained(
+            llm_path,
+            torch_dtype=args["torch_dtype"],
+            device_map="cpu",
+            trust_remote_code=True,
         )
-        model.load_state_dict(model_state_dict)
 
-    # WARNING: esm and llama weights are fixed
+    # 3) Instantiate the full model (ESM Cambrian + adapter + LLM)
+    model = ESMCambrianLLMInstructForCausalLM(
+        config=config,
+        llm_decoder=llm_decoder,  # if None, class loads from config.llm_model_name
+    )
+
+    # 4) (Optional) Load model checkpoint (state dict only)
+    ckpt_path = args.get("load_model_checkpoint_path")
+    if ckpt_path:
+        print(f"Loading checkpoint from {ckpt_path}")
+        state_dict = torch.load(ckpt_path, map_location="cpu")
+        model.load_state_dict(state_dict, strict=False)
+
     model.esm_encoder.requires_grad_(False)
-    model.llama_decoder.requires_grad_(False)
+    model.llm_decoder.requires_grad_(False)
 
     return model
 
@@ -218,7 +224,7 @@ def readout_embeddings(
 
 
 def get_sequence_embeddings(
-        model: Esm2LlamaInstructForCausalLM, 
+        model: ESMCambrianLLMInstructForCausalLM, 
         sequence_input_ids: torch.Tensor, 
         sequence_attention_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -237,7 +243,7 @@ def get_sequence_embeddings(
             return_encoder_outputs=True,
         )
 
-    adapter_output = model.adapter(encoder_output[0])
+    adapter_output = model.adapter(encoder_output.last_hidden_state)
     protein_attention_mask = sequence_attention_mask
     # adapter_output: (bsz, max_seq_len, decoder_hidden_size)
 
@@ -249,7 +255,7 @@ def get_sequence_embeddings(
 
 
 def get_description_embeddings(
-        model: Esm2LlamaInstructForCausalLM,
+        model: ESMCambrianLLMInstructForCausalLM,
         description_input_ids: torch.Tensor,
         description_attention_mask: torch.Tensor,
         output_llama_layer: int = 16,
@@ -490,7 +496,12 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
+    # Use ESM++ tokenizer for consistency with ESMCambrianLLMInstructForCausalLM model
+    esm_model = AutoModelForMaskedLM.from_pretrained(
+        "Synthyra/ESMplusplus_large", 
+        trust_remote_code=True
+    )
+    esm_tokenizer = esm_model.tokenizer
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"], 
         pad_token='<|reserved_special_token_0|>'
