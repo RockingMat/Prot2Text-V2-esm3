@@ -38,8 +38,11 @@ from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
-    Esm2LlamaInstructForCausalLM
+    ESMCConfig,
+    ESMCQwen
 )
+from transformers import AutoModelForCausalLM
+from esm.models.esmc import ESMC
 import scripts.utils_argparse as utils_argparse
 
 
@@ -125,30 +128,28 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     A general checkpoint shall contain the model state dict, optimizer state dict,
     and scheduler state dict.
     """
-    esm_encoder = EsmModel.from_pretrained(
-        args["esm_path"], 
-        add_pooling_layer=False,
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+    esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
+    esm_encoder = esm_encoder.to(args["torch_dtype"])
+
+    llm_decoder = AutoModelForCausalLM.from_pretrained(
+        ESMCConfig.llm_model_name,
+        trust_remote_code=True,
+        torch_dtype=args["torch_dtype"],
+        device_map="cpu",
     )
-    llama_decoder = LlamaForCausalLM.from_pretrained(
-        args["llama_path"], 
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
-        )
 
     adapter_config = ModalityAdapterConfig(
         input_dim=esm_encoder.config.hidden_size,
         intermediate_dim=2048,
-        output_dim=llama_decoder.config.hidden_size,
+        output_dim=llm_decoder.config.hidden_size,
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
     
-    model = Esm2LlamaInstructForCausalLM(
+    model = ESMCQwen(
         esm_encoder=esm_encoder,
         adapter=adapter,
-        llama_decoder=llama_decoder,
+        llm_decoder=llm_decoder,
     )
 
     if args["load_model_checkpoint_path"]:
@@ -161,9 +162,9 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
         )
         model.load_state_dict(model_state_dict)
 
-    # WARNING: esm and llama weights are fixed
+    # WARNING: esm and llm weights are fixed
     model.esm_encoder.requires_grad_(False)
-    model.llama_decoder.requires_grad_(False)
+    model.llm_decoder.requires_grad_(False)
 
     return model
 

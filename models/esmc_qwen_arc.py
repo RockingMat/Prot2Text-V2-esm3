@@ -20,47 +20,29 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from esm.models.esmc import ESMC
 from esm.sdk.api import ESMProtein, LogitsConfig
 
-from .configuration_esmc_llm import ESMCLLMConfig
+from .esmc_config import ESMCConfig
 from .modeling_esm2llama_instruct import ModalityAdapter
 
 
-class ESMCambrianLLMInstructForCausalLM(PreTrainedModel):
+class ESMCQwen(PreTrainedModel):
     """
-    Protein-to-text LM with ESM C encoder.
-    Simplified architecture matching Esm2LlamaInstructForCausalLM pattern.
-
-    ESMCambrianLLMInstructForCausalLM = ESM C + ModalityAdapter + LLM
+    ESMCQwen = ESM C + ModalityAdapter + LLM
     """
-
-    config_class = ESMCLLMConfig
-
     def __init__(
         self,
-        config: Optional[ESMCLLMConfig] = None,
-        llm_decoder: Optional[PreTrainedModel] = None,
-        **kwargs,
+        esm_encoder: ESMC,
+        adapter: ModalityAdapter,
+        llm_decoder: AutoModelForCausalLM
     ):
-        if config is None:
-            raise ValueError("config is required for ESMCambrianLLMInstructForCausalLM")
-        
+        config = ESMCConfig(
+            esm_config=esm_encoder.config,
+            adapter_config=adapter.config,
+            llm_config=llm_decoder.config
+        ) 
         super().__init__(config)
-
-        self.esm_encoder = ESMC.from_pretrained(config.esm_model_name)        
-        self.llm_decoder = (
-            llm_decoder
-            if llm_decoder is not None
-            else AutoModelForCausalLM.from_pretrained(
-                config.llm_model_name,
-                trust_remote_code=True,
-                device_map="auto"
-            )
-        )
-        
-        config.adapter_config.input_dim = 1152
-        config.adapter_config.output_dim = self.llm_decoder.config.hidden_size
-        self.adapter = ModalityAdapter(config.adapter_config)
-
-        self.post_init()
+        self.esm_encoder = esm_encoder
+        self.adapter = adapter
+        self.llm_decoder = llm_decoder
 
     def encode_protein_sequences(self, protein_sequences: List[str]) -> torch.Tensor:
         """

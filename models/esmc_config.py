@@ -1,25 +1,24 @@
-from dataclasses import dataclass
-from typing import Optional
-
-from .configuration_esm2llama_instruct import (
-    Esm2LlamaInstructConfig,
-    ModalityAdapterConfig,
-)
+from transformers import EsmConfig, PretrainedConfig
+from .modality_config import ModalityAdapterConfig
 
 
-@dataclass
-class ESMCLLMConfig(Esm2LlamaInstructConfig):
+class ESMCConfig(PretrainedConfig):
     """Configuration for ESM Cambrian + LLM model."""
     model_type = "esmC_llama_instruct"
     llm_model_name: str = "Qwen/Qwen3-14B"
     esm_model_name: str = "esmc_600m"
-    esm_hidden_size: Optional[int] = None
     
-    def __post_init__(self):
-        super().__post_init__()
-        if self.adapter_config is None:
-            self.adapter_config = ModalityAdapterConfig(
-                input_dim=0,
-                intermediate_dim=2048,
-                output_dim=0,
-            )
+    def __init__(
+            self, 
+            # model components
+            esm_config: EsmConfig, 
+            adapter_config: ModalityAdapterConfig,
+            llm_config: PretrainedConfig, 
+            # standalone attributes
+            placeholder_id: int = 128003
+    ):
+        super().__init__()
+        self.esm_config = esm_config
+        self.adapter_config = adapter_config
+        self.llm_config = llm_config
+        self.placeholder_id = placeholder_id
