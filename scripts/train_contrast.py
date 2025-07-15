@@ -12,17 +12,7 @@ inter-epoch evaluation.
 The script currently does not support save/load pretrained, gradient checkpointing 
 or generation under FSDP. 
 
-reference for AMP: https://pytorch.org/tutorials/recipes/recipes/    # prepare dataset and dataloader
-    # Use ESM++ tokenizer for compatibility with ESM Cambrian model
-    esm_model = AutoModelForMaskedLM.from_pretrained(
-        "Synthyra/ESMplusplus_large", 
-        trust_remote_code=True
-    )
-    esm_tokenizer = esm_model.tokenizer
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        args["llama_path"], 
-        pad_token='<|reserved_special_token_0|>'
-    )cipe.html 
+reference for AMP: https://pytorch.org/tutorials/recipes/recipes/recipe.html 
 
 * The script is designed for multi-GPU parallelism on single node.
 * On the cluster, print(...) will go to stdout and tqdm(...) will go to stderr.
@@ -41,17 +31,17 @@ from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForMaskedLM, LlamaModel, AutoModelForCausalLM
+from transformers import AutoTokenizer, LlamaModel, AutoModelForCausalLM
 
 from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
 from models.configuration_esmc_llm import ESMCLLMConfig, ModalityAdapterConfig
 from models.modeling_esmc_llm import ESMCambrianLLMInstructForCausalLM
-import scripts.utils_argparse as utils_argparse
+import scripts.utils_argparse
 
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str, help="[DEPRECATED] ESM path - now using fixed Synthyra/ESMplusplus_large")
+argParser.add_argument("--esm_model_name", type=str, default="esmc_600m", help="ESM model name to use (default: esmc_600m)")
 argParser.add_argument("--llama_path", type=str)
 argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -155,6 +145,7 @@ def load_model(args: Dict[str, Any]) -> ESMCambrianLLMInstructForCausalLM:
     model = ESMCambrianLLMInstructForCausalLM(
         config=config,
         llm_decoder=llm_decoder,  # if None, class loads from config.llm_model_name
+        esm_model_name=args.get("esm_model_name", "esmc_600m"),  # Use ESM C model
     )
 
     # 4) (Optional) Load model checkpoint (state dict only)
@@ -284,18 +275,13 @@ def teacher_forcing_forward_pass(
         data_batch: Dict[str, Any],
         contrastive_num_segments: int, 
 ) -> torch.Tensor:  # loss
-    """
-    Standard API for different models. Used in both `train_epoch` and `eval_epoch`.
-    Prepare inputs from dataloader, migrate variable to the same device as the model, 
-    and execute the forward pass with teacher forcing.
-
-    Returned loss is not scaled with gradient accumulation steps.
-
-    Due to the memory limit on GPUs, the similarity matrix will be computed in 
-    segments, and the loss will be averaged over the segments.
-    """
-    protein_input_ids = data_batch["protein_input_ids"].to(rank)
-    protein_attention_mask = data_batch["protein_attention_mask"].to(rank)
+    # Extract protein sequences and descriptions
+    protein_sequences = data_batch.get("protein_sequences")
+    if protein_sequences is None:
+        # Fallback for testing
+        batch_size = data_batch["description_input_ids"].shape[0]
+        protein_sequences = ["M" * 100] * batch_size
+    
     description_input_ids = data_batch["description_input_ids"].to(rank)
     description_attention_mask = data_batch["description_attention_mask"].to(rank)
 
@@ -303,7 +289,7 @@ def teacher_forcing_forward_pass(
     if isinstance(model, DistributedDataParallel):
         base_model = model.module
 
-    batch_size = protein_input_ids.size(0)
+    batch_size = len(protein_sequences)
     segment_size = batch_size // contrastive_num_segments
     if segment_size * contrastive_num_segments != batch_size:
         print(
@@ -323,17 +309,13 @@ def teacher_forcing_forward_pass(
         description_output = torch.nn.functional.normalize(description_output, p=2, dim=-1)
 
     for segment_id in range(contrastive_num_segments):
-        segment_protein_input_ids = protein_input_ids[
-            segment_id * segment_size:(segment_id + 1) * segment_size
-        ]
-        segment_protein_attention_mask = protein_attention_mask[
+        segment_protein_sequences = protein_sequences[
             segment_id * segment_size:(segment_id + 1) * segment_size
         ]
 
-        segment_protein_output = get_sequence_embeddings(
+        segment_protein_output = get_sequence_embeddings_from_sequences(
             base_model, 
-            segment_protein_input_ids, 
-            segment_protein_attention_mask
+            segment_protein_sequences
         )
         labels = torch.arange(
             segment_id * segment_size, 
@@ -496,21 +478,17 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    # Use ESM++ tokenizer for consistency with ESMCambrianLLMInstructForCausalLM model
-    esm_model = AutoModelForMaskedLM.from_pretrained(
-        "Synthyra/ESMplusplus_large", 
-        trust_remote_code=True
-    )
-    esm_tokenizer = esm_model.tokenizer
+    # For ESM C model, no tokenizer is needed as it uses raw protein sequences
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"], 
-        pad_token='<|reserved_special_token_0|>'
+        pad_token='<|im_end|>',  # Use <|im_end|> for Qwen3 fine-tuning
+        trust_remote_code=True  # Required for Qwen3
     )
 
     train_dataset = Prot2TextInstructDataset(
         root_dir=os.path.join(args["root_dataset_dir"], f"{args['train_split']}"),
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv"),
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # No tokenizer needed for ESM C
         description_tokenizer=llama_tokenizer,
         skip_reload=True,
         skip_download=True,
@@ -540,7 +518,7 @@ def train_on_device(
     eval_dataset = Prot2TextInstructDataset(
         root_dir=os.path.join(args["root_dataset_dir"], f"{args['eval_split']}"),
         csv_path=os.path.join(args["root_csv_dir"], f"{args['eval_split']}.csv"),
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # No tokenizer needed for ESM C
         description_tokenizer=llama_tokenizer,
         skip_reload=True,
         skip_download=True,

@@ -98,8 +98,8 @@ class Prot2TextLightDataset(torch.utils.data.Dataset):
 class Prot2TextLightCollater: 
     def __init__(
             self, 
-            sequence_tokenizer: PreTrainedTokenizer,
             description_tokenizer: PreTrainedTokenizer,
+            sequence_tokenizer: Optional[PreTrainedTokenizer] = None,  # Optional for ESM C
             mode: Literal["train", "inference"] = "train", 
             include_text_fields: bool = True,
             name_dropout: float = 0.8, 
@@ -150,27 +150,34 @@ class Prot2TextLightCollater:
         ]
 
         # for each sequence in sequences
-        # if the sequence is origianlly longer than max_sequence_length, take a segment of that length randomly 
+        # if the sequence is originally longer than max_sequence_length, take a segment of that length randomly 
         # else do nothing
         for i in range(len(sequences)):
             if len(sequences[i]) > self.max_sequence_length:
                 start = random.randint(0, len(sequences[i]) - self.max_sequence_length)
                 sequences[i] = sequences[i][start:start + self.max_sequence_length]
 
-        # truncate and tokenize sequences
-        self.sequence_tokenizer.padding_side = "right"
-        tokenized_sequences = self.sequence_tokenizer(
-            sequences, 
-            truncation=True, 
-            padding="longest", 
-            max_length=self.max_sequence_length + 2,  # including bos and eos tokens of esm tokenizer
-            return_tensors="pt"
-        )
-        sequence_input_ids = tokenized_sequences["input_ids"]
-        sequence_attention_mask = tokenized_sequences["attention_mask"]
+        # For ESM C, we pass sequences directly (no tokenization needed)
+        if self.sequence_tokenizer is not None:
+            # Legacy mode: tokenize sequences
+            self.sequence_tokenizer.padding_side = "right"
+            tokenized_sequences = self.sequence_tokenizer(
+                sequences, 
+                truncation=True, 
+                padding="longest", 
+                max_length=self.max_sequence_length + 2,  # including bos and eos tokens of esm tokenizer
+                return_tensors="pt"
+            )
+            sequence_input_ids = tokenized_sequences["input_ids"]
+            sequence_attention_mask = tokenized_sequences["attention_mask"]
+            sequence_lens = sequence_attention_mask.sum(dim=1).tolist()
+        else:
+            # ESM C mode: use raw sequences
+            sequence_input_ids = None
+            sequence_attention_mask = None
+            sequence_lens = [len(seq) for seq in sequences]
 
         # apply chat template
-        sequence_lens = sequence_attention_mask.sum(dim=1).tolist()
 
         if self.include_text_fields: 
             user_messages = [
@@ -238,6 +245,7 @@ class Prot2TextLightCollater:
         if self.mode == "train": 
             return {
                 "name": accessions,
+                "protein_sequences": sequences,  # Raw sequences for ESM C
                 "protein_input_ids": sequence_input_ids, 
                 "protein_attention_mask": sequence_attention_mask, 
                 "input_ids": torch.cat([
@@ -262,6 +270,7 @@ class Prot2TextLightCollater:
         elif self.mode == "inference":
             return {
                 "name": accessions,
+                "protein_sequences": sequences,  # Raw sequences for ESM C
                 "protein_input_ids": sequence_input_ids, 
                 "protein_attention_mask": sequence_attention_mask, 
                 "input_ids": prompt_input_ids, 

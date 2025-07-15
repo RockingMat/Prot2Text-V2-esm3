@@ -1,17 +1,24 @@
 """
-ESM Cambrian → ModalityAdapter → Qwen-14B (or any HF CausalLM) in one class.
+ESM C → ModalityAdapter → Qwen3-14B (or any HF CausalLM) in one class.
+
+Simplified pipeline:
+1. Raw protein sequences → ESM C encoder → protein embeddings
+2. Protein embeddings → ModalityAdapter → aligned embeddings  
+3. Aligned embeddings + text tokens → Qwen3-14B → text output
 """
 
-from typing import Optional, Union
+from typing import Optional, Union, List
 
 import torch
 from transformers import (
-    AutoModelForMaskedLM,
     AutoModelForCausalLM,
     PreTrainedModel
 )
 from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
+
+from esm.models.esmc import ESMC
+from esm.sdk.api import ESMProtein, LogitsConfig
 
 from .configuration_esmc_llm import ESMCLLMConfig
 from .modeling_esm2llama_instruct import ModalityAdapter
@@ -19,10 +26,10 @@ from .modeling_esm2llama_instruct import ModalityAdapter
 
 class ESMCambrianLLMInstructForCausalLM(PreTrainedModel):
     """
-    Protein-to-text LM with ESM Cambrian (600M) encoder.
+    Protein-to-text LM with ESM C encoder.
     Simplified architecture matching Esm2LlamaInstructForCausalLM pattern.
 
-    ESMCambrianLLMInstructForCausalLM = ESM Cambrian + ModalityAdapter + LLM
+    ESMCambrianLLMInstructForCausalLM = ESM C + ModalityAdapter + LLM
     """
 
     config_class = ESMCLLMConfig
@@ -38,33 +45,52 @@ class ESMCambrianLLMInstructForCausalLM(PreTrainedModel):
         
         super().__init__(config)
 
-        # ESM Cambrian encoder - use ESM++ implementation with built-in tokenizer
-        self.esm_encoder = AutoModelForMaskedLM.from_pretrained(
-            "Synthyra/ESMplusplus_large",  # ESM++ provides HuggingFace compatibility
-            trust_remote_code=True
-        )
-        
-        # ESM++ provides a built-in tokenizer
-        self.esm_tokenizer = self.esm_encoder.tokenizer
-        
-        # LLM decoder (default: Qwen-14B)
-        model_name = getattr(config, 'llm_model_name', 'qwen/Qwen-14B')
+        self.esm_encoder = ESMC.from_pretrained(config.esm_model_name)        
         self.llm_decoder = (
             llm_decoder
             if llm_decoder is not None
             else AutoModelForCausalLM.from_pretrained(
-                model_name,
+                config.llm_model_name,
                 trust_remote_code=True,
                 device_map="auto"
             )
         )
         
-        # Set adapter dimensions and create adapter
-        config.adapter_config.input_dim = self.esm_encoder.config.hidden_size
+        config.adapter_config.input_dim = 1152
         config.adapter_config.output_dim = self.llm_decoder.config.hidden_size
         self.adapter = ModalityAdapter(config.adapter_config)
 
         self.post_init()
+
+    def encode_protein_sequences(self, protein_sequences: List[str]) -> torch.Tensor:
+        """
+        Encode protein sequences using ESM C.
+        
+        Args:
+            protein_sequences: List of protein sequences (strings)
+            
+        Returns:
+            Protein embeddings tensor (batch_size, seq_len, hidden_size)
+        """
+        # Convert to ESMProtein objects
+        proteins = [ESMProtein(sequence=seq) for seq in protein_sequences]
+        
+        # Encode each protein
+        protein_tensors = [self.esm_encoder.encode(protein) for protein in proteins]
+        
+        # Get embeddings using logits API
+        batch_embeddings = []
+        for protein_tensor in protein_tensors:
+            logits_output = self.esm_encoder.logits(
+                protein_tensor, 
+                LogitsConfig(sequence=True, return_embeddings=True)
+            )
+            batch_embeddings.append(logits_output.embeddings)
+        
+        # Stack embeddings
+        encoder_hidden_states = torch.stack(batch_embeddings, dim=0)
+        
+        return encoder_hidden_states
 
     def prepare_decoder_inputs(
         self,
@@ -106,137 +132,157 @@ class ESMCambrianLLMInstructForCausalLM(PreTrainedModel):
 
     def forward(
         self,
-        # Standard text inputs (matching esm2llama_instruct interface)
-        input_ids: Optional[torch.LongTensor] = None,
+        # Text inputs
+        input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_values: Optional[torch.Tensor] = None,
         labels: Optional[torch.LongTensor] = None,
-        # Protein inputs (matching esm2llama_instruct interface)
+        # Protein inputs (simplified - use raw sequences)
+        protein_sequences: Optional[List[str]] = None,
+        # Legacy support for tokenized proteins
         protein_input_ids: Optional[torch.LongTensor] = None,
         protein_attention_mask: Optional[torch.LongTensor] = None,
-        protein_position_ids: Optional[torch.LongTensor] = None,
-        protein_head_mask: Optional[torch.LongTensor] = None,
-        protein_inputs_embeds: Optional[torch.FloatTensor] = None,
-        # Control arguments
+        # Generation parameters
         use_cache: Optional[bool] = None,
-        output_attentions: Optional[bool] = None,
-        output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
-        return_encoder_outputs: bool = False,
-        return_adapter_outputs: bool = False,
-        return_decoder_inputs: bool = False,
-        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs,
     ) -> Union[tuple, CausalLMOutputWithPast]:
         """
-        Forward pass supporting tokenized inputs only (matching esm2llama_instruct interface).
+        Simple forward pass: protein sequences → ESM C → adapter → Qwen3-14B
         
         Args:
-            input_ids: Text token IDs (standard transformers interface)
+            input_ids: Text token IDs
             attention_mask: Text attention mask
-            position_ids: Position indices for text tokens
-            past_key_values: Cached key-value pairs for generation
             labels: Labels for training
-            protein_input_ids: Tokenized protein sequences (standard interface)
-            protein_attention_mask: Attention mask for protein sequences
-            protein_position_ids: Position indices for protein tokens
-            protein_head_mask: Head mask for protein attention
-            protein_inputs_embeds: Pre-computed protein embeddings
-            use_cache: Whether to use caching
-            output_attentions: Whether to output attention weights
-            output_hidden_states: Whether to output hidden states
-            return_dict: Whether to return dict output
-            return_encoder_outputs: Whether to return encoder outputs only
-            return_adapter_outputs: Whether to return adapter outputs only
-            return_decoder_inputs: Whether to return decoder inputs only
-            cache_position: Cache position for generation
+            protein_sequences: Raw protein sequences (preferred)
+            protein_input_ids: Tokenized protein sequences (legacy)
+            protein_attention_mask: Protein attention mask (legacy)
             
         Returns:
-            Model outputs (tuple or CausalLMOutputWithPast)
+            Model outputs
         """
-        # ESM Cambrian encoder forward
-        encoder_output = self.esm_encoder(
-            input_ids=protein_input_ids,
-            attention_mask=protein_attention_mask,
-            return_dict=True
-        )
-        encoder_hidden_states = encoder_output.last_hidden_state
-        encoder_attention_mask = protein_attention_mask
+        # Step 1: Encode protein sequences
+        if protein_sequences is not None:
+            # Use raw sequences (preferred)
+            protein_embeddings = self.encode_protein_sequences(protein_sequences)
+        elif protein_input_ids is not None:
+            # Legacy support - convert tokenized sequences back to strings
+            # This is a fallback for existing training scripts
+            raise NotImplementedError("Legacy protein_input_ids support not implemented. Use protein_sequences instead.")
+        else:
+            # Create dummy embeddings for testing
+            batch_size = input_ids.shape[0]
+            seq_len = 512
+            protein_embeddings = torch.zeros(
+                (batch_size, seq_len, 1280),
+                dtype=torch.float32,
+                device=input_ids.device
+            )
         
-        if return_encoder_outputs:
-            return encoder_output
-
-        # Adapter forward
-        adapter_output = self.adapter(encoder_hidden_states)
-        if return_adapter_outputs:
-            return adapter_output, encoder_attention_mask
-
-        # Decoder input preparation
-        inputs_embeds, attention_mask = self.prepare_decoder_inputs(
-            input_ids=input_ids,
-            encoder_hidden_states=adapter_output,
-            attention_mask=attention_mask,
-            encoder_attention_mask=encoder_attention_mask,
+        # Step 2: Adapt protein embeddings
+        adapted_embeddings = self.adapter(protein_embeddings)
+        
+        # Step 3: Prepare inputs for LLM
+        # Get text embeddings
+        text_embeddings = self.llm_decoder.get_input_embeddings()(input_ids)
+        
+        # For now, use simple concatenation (can be improved with placeholder replacement)
+        # Concatenate protein embeddings with text embeddings
+        combined_embeddings = torch.cat([adapted_embeddings, text_embeddings], dim=1)
+        
+        # Create combined attention mask
+        protein_mask = torch.ones(
+            (adapted_embeddings.shape[0], adapted_embeddings.shape[1]),
+            dtype=torch.long,
+            device=input_ids.device
         )
-        if return_decoder_inputs:
-            return inputs_embeds, attention_mask
-
-        # LLM decoder forward
+        if attention_mask is None:
+            attention_mask = torch.ones_like(input_ids)
+        
+        combined_attention_mask = torch.cat([protein_mask, attention_mask], dim=1)
+        
+        # Adjust labels if provided
+        if labels is not None:
+            # Add -100 labels for protein embeddings (don't compute loss on protein part)
+            protein_labels = torch.full(
+                (labels.shape[0], adapted_embeddings.shape[1]),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device
+            )
+            combined_labels = torch.cat([protein_labels, labels], dim=1)
+        else:
+            combined_labels = None
+        
+        # Step 4: Forward through LLM
         return self.llm_decoder(
             input_ids=None,
-            attention_mask=attention_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            labels=labels,
+            attention_mask=combined_attention_mask,
+            inputs_embeds=combined_embeddings,
+            labels=combined_labels,
             use_cache=use_cache,
-            output_attentions=output_attentions,
             return_dict=return_dict,
-            cache_position=cache_position
+            **kwargs
         )
 
     def generate(
         self,
-        inputs: torch.LongTensor,  # alias for input_ids (standard interface)
+        input_ids: torch.LongTensor,
         attention_mask: Optional[torch.LongTensor] = None,
-        protein_input_ids: Optional[torch.LongTensor] = None,
-        protein_attention_mask: Optional[torch.LongTensor] = None,
-        protein_inputs_embeds: Optional[torch.FloatTensor] = None,
+        protein_sequences: Optional[List[str]] = None,
         **kwargs,
     ) -> Union[GenerateOutput, torch.LongTensor]:
         """
         Generate text given protein sequences and text prompts.
-        Compatible with ESM2LlamaInstruct interface.
         
         Args:
-            inputs: Input token IDs (standard transformers interface, alias for input_ids)
+            input_ids: Input token IDs (text prompt)
             attention_mask: Attention mask for input tokens
-            protein_input_ids: Tokenized protein sequences
-            protein_attention_mask: Attention mask for protein sequences
-            protein_inputs_embeds: Pre-computed protein embeddings
+            protein_sequences: List of protein sequences (strings)
             **kwargs: Additional generation arguments
             
         Returns:
             Generated sequences
         """
-        # Get prompt embeddings using forward pass
-        prompt_embeds, prompt_mask = self(
-            input_ids=inputs,
-            attention_mask=attention_mask,
-            protein_input_ids=protein_input_ids,
-            protein_attention_mask=protein_attention_mask,
-            protein_inputs_embeds=protein_inputs_embeds,
-            use_cache=False,
-            output_attentions=False,
-            output_hidden_states=False,
-            return_dict=False,
-            return_decoder_inputs=True
-        )
+        # Get combined embeddings using forward pass
+        # We'll use forward pass to get the combined embeddings
+        with torch.no_grad():
+            # Step 1: Encode protein sequences
+            if protein_sequences is not None:
+                protein_embeddings = self.encode_protein_sequences(protein_sequences)
+            else:
+                # Create dummy embeddings
+                batch_size = input_ids.shape[0]
+                seq_len = 512
+                protein_embeddings = torch.zeros(
+                    (batch_size, seq_len, 1280),
+                    dtype=torch.float32,
+                    device=input_ids.device
+                )
+            
+            # Step 2: Adapt protein embeddings
+            adapted_embeddings = self.adapter(protein_embeddings)
+            
+            # Step 3: Prepare inputs for LLM
+            text_embeddings = self.llm_decoder.get_input_embeddings()(input_ids)
+            
+            # Concatenate protein embeddings with text embeddings
+            combined_embeddings = torch.cat([adapted_embeddings, text_embeddings], dim=1)
+            
+            # Create combined attention mask
+            protein_mask = torch.ones(
+                (adapted_embeddings.shape[0], adapted_embeddings.shape[1]),
+                dtype=torch.long,
+                device=input_ids.device
+            )
+            if attention_mask is None:
+                attention_mask = torch.ones_like(input_ids)
+            
+            combined_attention_mask = torch.cat([protein_mask, attention_mask], dim=1)
         
-        # Do generate on llm_decoder
+        # Step 4: Generate using LLM
         return self.llm_decoder.generate(
-            inputs_embeds=prompt_embeds,
-            attention_mask=prompt_mask,
+            inputs_embeds=combined_embeddings,
+            attention_mask=combined_attention_mask,
             **kwargs,
         )
 

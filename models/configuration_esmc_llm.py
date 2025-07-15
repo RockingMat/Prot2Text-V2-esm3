@@ -11,7 +11,8 @@ from .configuration_esm2llama_instruct import (
 class ESMCLLMConfig(Esm2LlamaInstructConfig):
     """Configuration for ESM Cambrian + LLM model."""
     model_type = "esmC_llama_instruct"
-    llm_model_name: str = "qwen/Qwen-14B"
+    llm_model_name: str = "Qwen/Qwen3-14B"
+    esm_model_name: str = "esmc_600m"
     esm_hidden_size: Optional[int] = None
     
     def __post_init__(self):

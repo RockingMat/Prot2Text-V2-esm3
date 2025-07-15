@@ -34,7 +34,7 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModelForMaskedLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from models.configuration_esmc_llm import ESMCLLMConfig, ModalityAdapterConfig
 from models.modeling_esmc_llm import ESMCambrianLLMInstructForCausalLM
@@ -45,7 +45,8 @@ import scripts.utils_argparse as utils_argparse
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str, help="[DEPRECATED] ESM path - now using fixed Synthyra/ESMplusplus_large")
+argParser.add_argument("--esm_model_name", type=str, default="esmc_600m", help="ESM C model name (esmc_300m, esmc_600m)")
+argParser.add_argument("--esm_path", type=str, help="[DEPRECATED] ESM path - now using ESM C models")
 argParser.add_argument("--llama_path", type=str)
 # argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -178,21 +179,15 @@ def teacher_forcing_forward_pass(
         data_batch: Dict[str, Any],
 ) -> torch.Tensor:  # loss
     """
-    Standard API for different models. Used in both `train_epoch` and `eval_epoch`.
-    Prepare inputs from dataloader, migrate variable to the same device as the model, 
-    and execute the forward pass with teacher forcing.
-
-    Returned loss is not scaled with gradient accumulation steps.
+    Simplified forward pass for ESM Cambrian model.
+    Uses raw protein sequences from the dataset.
     """
     return model(
         input_ids=data_batch["input_ids"].to(rank),
         attention_mask=data_batch["attention_mask"].to(rank),
         labels=data_batch["labels"].to(rank),
-        protein_input_ids=data_batch["protein_input_ids"].to(rank),
-        protein_attention_mask=data_batch["protein_attention_mask"].to(rank),
+        protein_sequences=data_batch["protein_sequences"],  # Raw sequences
         use_cache=False,
-        output_attentions=False, 
-        output_hidden_states=False,
         return_dict=False,
     )[0]
 
@@ -341,15 +336,11 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    # Use ESM++ tokenizer for consistency with ESMCambrianLLMInstructForCausalLM model
-    esm_model = AutoModelForMaskedLM.from_pretrained(
-        "Synthyra/ESMplusplus_large", 
-        trust_remote_code=True
-    )
-    esm_tokenizer = esm_model.tokenizer
+    # Use ESM C for protein encoding - no separate tokenizer needed
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"], 
-        pad_token='<|reserved_special_token_0|>'
+        pad_token='<|im_end|>',  # Use <|im_end|> for Qwen3 fine-tuning
+        trust_remote_code=True  # Required for Qwen3
     )
 
     train_dataset = Prot2TextLightDataset(
@@ -365,7 +356,7 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # No tokenization needed for ESM C
         description_tokenizer=llama_tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],

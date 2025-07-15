@@ -17,7 +17,7 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForMaskedLM, PreTrainedTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizer
 
 # from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
@@ -27,7 +27,7 @@ import scripts.utils_argparse as utils_argparse
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str, help="[DEPRECATED] ESM path - now using fixed Synthyra/ESMplusplus_large")
+argParser.add_argument("--esm_model_name", type=str, default="esmc_600m", help="ESM model name to use (default: esmc_600m)")
 argParser.add_argument("--llama_path", type=str)
 argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -153,12 +153,7 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     setup(rank, world_size)
  
     # prepare dataset and dataloader
-    # Use ESM++ tokenizer for consistency with ESMCambrianLLMInstructForCausalLM model
-    esm_model = AutoModelForMaskedLM.from_pretrained(
-        "Synthyra/ESMplusplus_large", 
-        trust_remote_code=True
-    )
-    esm_tokenizer = esm_model.tokenizer
+    # For ESM C model, no tokenizer is needed as it uses raw protein sequences
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"],
         pad_token='<|reserved_special_token_0|>'
@@ -169,7 +164,7 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     )
  
     generate_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # No tokenizer needed for ESM C
         description_tokenizer=llama_tokenizer,
         mode="inference",
         include_text_fields=True, 

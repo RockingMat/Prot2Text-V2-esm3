@@ -15,7 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, AutoModelForMaskedLM, PreTrainedTokenizer
+from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
 from .train_instruct import load_model, setup, cleanup
@@ -24,7 +24,7 @@ import scripts.utils_argparse as utils_argparse
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
+argParser.add_argument("--esm_model_name", type=str, default="esmc_600m", help="ESM model name to use (default: esmc_600m)")
 argParser.add_argument("--llama_path", type=str)
 argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -148,12 +148,7 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     setup(rank, world_size)
 
     # prepare dataset and dataloader
-    # Use ESM++ tokenizer for compatibility with ESM Cambrian model
-    esm_model = AutoModelForMaskedLM.from_pretrained(
-        "Synthyra/ESMplusplus_large", 
-        trust_remote_code=True
-    )
-    esm_tokenizer = esm_model.tokenizer
+    # For ESM C model, no tokenizer is needed as it uses raw protein sequences
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"], 
         pad_token='<|reserved_special_token_0|>'
@@ -162,7 +157,7 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     generate_dataset = Prot2TextInstructDataset(
         root_dir=os.path.join(args["root_dataset_dir"], f"{args['generate_split']}"),
         csv_path=os.path.join(args["root_csv_dir"], f"{args['generate_split']}.csv"),
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # No tokenizer needed for ESM C
         description_tokenizer=llama_tokenizer,
         skip_reload=True,
         skip_download=True,
