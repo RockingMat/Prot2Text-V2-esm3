@@ -155,13 +155,14 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
 
     if args["load_model_checkpoint_path"]:
         print(f"Loading {args['load_model_checkpoint_path']}")
-        model_state_dict = torch.load(
+        adapter_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="cpu"  # load to CPU first
+            map_location="auto",  # load to CPU first
+            low_cpu_mem_usage=True
             # will be loaded to where the weights were saved from if not specified
         )
-        model.load_state_dict(model_state_dict)
+        model.adapter.load_state_dict(adapter_state_dict)
 
     # WARNING: esm and llama weights are fixed
     model.esm_encoder.requires_grad_(False)
@@ -617,13 +618,13 @@ def train_on_device(
             or epoch_idx == args["num_epochs"] 
             or epoch_idx % args["save_every_epochs"] == 0
         ):
-            model_state_dict = model.module.state_dict()
+            adapter_state_dict = model.module.adapter.state_dict()
             if rank == 0:
                 model_checkpoint_path = os.path.join(
                     args["save_checkpoint_dir"], 
                     f"model_checkpoint_{epoch_idx}.pt"
                 )
-                torch.save(model_state_dict, model_checkpoint_path)
+                torch.save(adapter_state_dict, model_checkpoint_path)
                 print(f"Saving {model_checkpoint_path}")
 
                 optimizer_scheduler_checkpoint_path = os.path.join(
