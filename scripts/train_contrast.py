@@ -129,12 +129,14 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
         args["esm_path"], 
         add_pooling_layer=False,
         torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+        device_map="auto",
+        low_cpu_mem_usage=True
     )
     llama_decoder = LlamaForCausalLM.from_pretrained(
         args["llama_path"], 
         torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+        device_map="auto",
+        low_cpu_mem_usage=True
         )
 
     adapter_config = ModalityAdapterConfig(
