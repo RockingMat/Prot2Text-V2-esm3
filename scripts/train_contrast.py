@@ -24,6 +24,7 @@ import os
 from typing import Any, Dict, Literal, Union
 
 import torch
+import torch.utils.data
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
@@ -34,7 +35,7 @@ from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedModel
 from transformers import EsmModel, LlamaModel, LlamaForCausalLM
 
-from dataset import Prot2TextInstructDataset, Prot2TextInstructDataLoader
+from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
@@ -50,7 +51,7 @@ argParser = argparse.ArgumentParser()
 
 argParser.add_argument("--esm_path", type=str)
 argParser.add_argument("--llama_path", type=str)
-argParser.add_argument("--root_dataset_dir", type=str)
+# Note: root_dataset_dir is no longer needed with lightweight dataloader
 argParser.add_argument("--root_csv_dir", type=str)
 argParser.add_argument("--save_checkpoint_dir", type=str)
 argParser.add_argument("--load_model_checkpoint_path", type=str, default="")
@@ -135,7 +136,7 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
         ESMCConfig.llm_model_name,
         trust_remote_code=True,
         torch_dtype=args["torch_dtype"],
-        device_map="cpu",
+        device_map="auto",
     )
 
     adapter_config = ModalityAdapterConfig(
@@ -154,13 +155,14 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
 
     if args["load_model_checkpoint_path"]:
         print(f"Loading {args['load_model_checkpoint_path']}")
-        model_state_dict = torch.load(
+        adapter_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="cpu"  # load to CPU first
+            map_location="auto",  # load to CPU first
+            low_cpu_mem_usage=True
             # will be loaded to where the weights were saved from if not specified
         )
-        model.load_state_dict(model_state_dict)
+        model.adapter.load_state_dict(adapter_state_dict)
 
     # WARNING: esm and llm weights are fixed
     model.esm_encoder.requires_grad_(False)
@@ -359,6 +361,7 @@ def setup(rank: int, world_size: int):
     os.environ['MASTER_PORT'] = os.getenv('MASTER_PORT', '9901')
     # initialize the process group
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
 def cleanup():
@@ -370,7 +373,7 @@ def train_epoch(
         rank: int,
         current_epoch: int,
         model: Union[DistributedDataParallel, FullyShardedDataParallel],
-        dataloader: Prot2TextInstructDataLoader,
+        dataloader: torch.utils.data.DataLoader,
         optimizer: Optimizer,
         args: Dict[str, Any]
 ):
@@ -448,7 +451,7 @@ def eval_epoch(
         rank: int,
         current_epoch: int, 
         model: Union[DistributedDataParallel, FullyShardedDataParallel],
-        dataloader: Prot2TextInstructDataLoader,
+        dataloader: torch.utils.data.DataLoader,
         args: Dict[str, Any]
 ):
     """Iterate over all batches in evaluation with teacher forcing"""
@@ -501,26 +504,29 @@ def train_on_device(
         pad_token='<|reserved_special_token_0|>'
     )
 
-    train_dataset = Prot2TextInstructDataset(
-        root_dir=os.path.join(args["root_dataset_dir"], f"{args['train_split']}"),
-        csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv"),
-        sequence_tokenizer=esm_tokenizer,
-        description_tokenizer=llama_tokenizer,
-        skip_reload=True,
-        skip_download=True,
-        ignore_graph_features=True,
+    train_dataset = Prot2TextLightDataset(
+        csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv")
     )
     if args["debug_trim_train_split"]:
-        train_dataset.usable_file_names = train_dataset.usable_file_names[
-            :args["debug_trim_train_split"]
-        ]
+        # Trim the dataset for debugging
+        original_data = train_dataset.data
+        train_dataset.data = original_data[:args["debug_trim_train_split"]]
+    
     train_sampler = DistributedSampler(
         train_dataset, 
         rank=rank, 
         num_replicas=world_size, 
         shuffle=True
-        )
-    train_loader = Prot2TextInstructDataLoader(
+    )
+    
+    train_collater = Prot2TextLightCollater(
+        sequence_tokenizer=esm_tokenizer,
+        description_tokenizer=llama_tokenizer,
+        mode="train",
+        include_text_fields=True,
+    )
+    
+    train_loader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args["batch_size_per_device"],
         sampler=train_sampler,
@@ -528,29 +534,33 @@ def train_on_device(
         pin_memory=True,  # enable page-locked memory allocation for faster data transfer to GPUs
         shuffle=False,  # avoid shuffling twice with DistributedSampler
         drop_last=True,  # avoid incomplete batch at the end
+        collate_fn=train_collater,
     )
     print(f"Train dataset loaded on rank:{rank}")
 
-    eval_dataset = Prot2TextInstructDataset(
-        root_dir=os.path.join(args["root_dataset_dir"], f"{args['eval_split']}"),
-        csv_path=os.path.join(args["root_csv_dir"], f"{args['eval_split']}.csv"),
-        sequence_tokenizer=esm_tokenizer,
-        description_tokenizer=llama_tokenizer,
-        skip_reload=True,
-        skip_download=True,
-        ignore_graph_features=True,
+    eval_dataset = Prot2TextLightDataset(
+        csv_path=os.path.join(args["root_csv_dir"], f"{args['eval_split']}.csv")
     )
     if args["debug_trim_eval_split"]:
-        eval_dataset.usable_file_names = eval_dataset.usable_file_names[
-            :args["debug_trim_eval_split"]
-        ]
+        # Trim the dataset for debugging
+        original_data = eval_dataset.data
+        eval_dataset.data = original_data[:args["debug_trim_eval_split"]]
+    
     eval_sampler = DistributedSampler(
         eval_dataset, 
         rank=rank, 
         num_replicas=world_size, 
         shuffle=False
     )
-    eval_loader = Prot2TextInstructDataLoader(
+    
+    eval_collater = Prot2TextLightCollater(
+        sequence_tokenizer=esm_tokenizer,
+        description_tokenizer=llama_tokenizer,
+        mode="train",  # Use train mode for contrastive learning (need both sequences and descriptions)
+        include_text_fields=True,
+    )
+    
+    eval_loader = torch.utils.data.DataLoader(
         eval_dataset,
         batch_size=args["batch_size_per_device"],
         sampler=eval_sampler,
@@ -558,6 +568,7 @@ def train_on_device(
         pin_memory=True,
         shuffle=False,
         drop_last=True,
+        collate_fn=eval_collater,
     )
     print(f"Eval dataset loaded on rank:{rank}")
 
@@ -616,13 +627,13 @@ def train_on_device(
             or epoch_idx == args["num_epochs"] 
             or epoch_idx % args["save_every_epochs"] == 0
         ):
-            model_state_dict = model.module.state_dict()
+            adapter_state_dict = model.module.adapter.state_dict()
             if rank == 0:
                 model_checkpoint_path = os.path.join(
                     args["save_checkpoint_dir"], 
                     f"model_checkpoint_{epoch_idx}.pt"
                 )
-                torch.save(model_state_dict, model_checkpoint_path)
+                torch.save(adapter_state_dict, model_checkpoint_path)
                 print(f"Saving {model_checkpoint_path}")
 
                 optimizer_scheduler_checkpoint_path = os.path.join(
