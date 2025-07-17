@@ -32,15 +32,11 @@ class ESMCQwen(PreTrainedModel):
     """
     def __init__(
         self,
+        config: ESMCConfig,
         esm_encoder: ESMC,
         adapter: ModalityAdapter,
         llm_decoder: AutoModelForCausalLM
     ):
-        config = ESMCConfig(
-            esm_config=esm_encoder.config,
-            adapter_config=adapter.config,
-            llm_config=llm_decoder.config
-        ) 
         super().__init__(config)
         self.esm_encoder = esm_encoder
         self.adapter = adapter
