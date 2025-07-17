@@ -9,7 +9,7 @@ Pipeline:
 5. Combined embeddings → Qwen3-14B → text output
 """
 
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Tuple
 
 import torch
 from transformers import (
@@ -42,7 +42,7 @@ class ESMCQwen(PreTrainedModel):
         self.adapter = adapter
         self.llm_decoder = llm_decoder
 
-    def encode_protein_sequences(self, protein_sequences: List[str]) -> torch.Tensor:
+    def encode_protein_sequences(self, protein_sequences: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Encode protein sequences using ESM C.
         
@@ -50,7 +50,9 @@ class ESMCQwen(PreTrainedModel):
             protein_sequences: List of protein sequences (strings)
             
         Returns:
-            Protein embeddings tensor (batch_size, seq_len, hidden_size)
+            Tuple of (protein_embeddings, attention_mask):
+            - protein_embeddings: tensor (batch_size, seq_len, hidden_size)
+            - attention_mask: tensor (batch_size, seq_len) with 1 for valid positions, 0 for padded
         """
         # Convert to ESMProtein objects
         proteins = [ESMProtein(sequence=seq) for seq in protein_sequences]
@@ -60,17 +62,60 @@ class ESMCQwen(PreTrainedModel):
         
         # Get embeddings using logits API
         batch_embeddings = []
+        original_lengths = []
         for protein_tensor in protein_tensors:
             logits_output = self.esm_encoder.logits(
                 protein_tensor, 
                 LogitsConfig(sequence=True, return_embeddings=True)
             )
             batch_embeddings.append(logits_output.embeddings)
+            original_lengths.append(logits_output.embeddings.shape[1])
         
-        # Stack embeddings
-        encoder_hidden_states = torch.stack(batch_embeddings, dim=0)
+        # Pad embeddings to the same length
+        if len(batch_embeddings) > 1:
+            # Find the maximum sequence length
+            max_seq_len = max(emb.shape[1] for emb in batch_embeddings)
+            hidden_size = batch_embeddings[0].shape[2]
+            
+            # Pad each embedding to max_seq_len and create attention masks
+            padded_embeddings = []
+            attention_masks = []
+            for emb, orig_len in zip(batch_embeddings, original_lengths):
+                seq_len = emb.shape[1]
+                if seq_len < max_seq_len:
+                    # Pad with zeros
+                    padding = torch.zeros(
+                        (1, max_seq_len - seq_len, hidden_size),
+                        dtype=emb.dtype,
+                        device=emb.device
+                    )
+                    padded_emb = torch.cat([emb, padding], dim=1)
+                    padded_embeddings.append(padded_emb)
+                    
+                    # Create attention mask: 1 for valid positions, 0 for padded
+                    mask = torch.cat([
+                        torch.ones(orig_len, dtype=torch.long, device=emb.device),
+                        torch.zeros(max_seq_len - orig_len, dtype=torch.long, device=emb.device)
+                    ])
+                    attention_masks.append(mask)
+                else:
+                    padded_embeddings.append(emb)
+                    mask = torch.ones(orig_len, dtype=torch.long, device=emb.device)
+                    attention_masks.append(mask)
+            
+            # Stack the padded embeddings and attention masks
+            encoder_hidden_states = torch.stack(padded_embeddings, dim=0)
+            attention_mask = torch.stack(attention_masks, dim=0)
+        else:
+            # Single sequence case
+            encoder_hidden_states = torch.stack(batch_embeddings, dim=0)
+            attention_mask = torch.ones(
+                (1, batch_embeddings[0].shape[1]), 
+                dtype=torch.long, 
+                device=batch_embeddings[0].device
+            )
         
-        return encoder_hidden_states
+        return encoder_hidden_states, attention_mask
 
     def prepare_decoder_inputs(
         self,
@@ -162,7 +207,7 @@ class ESMCQwen(PreTrainedModel):
             Model outputs or encoder outputs if return_encoder_outputs=True
         """
         # Step 1: Encode protein sequences
-        protein_embeddings = self.encode_protein_sequences(protein_sequences)
+        protein_embeddings, protein_attention_mask = self.encode_protein_sequences(protein_sequences)
         
         # Step 2: Adapt protein embeddings
         adapted_embeddings = self.adapter(protein_embeddings)
@@ -175,12 +220,8 @@ class ESMCQwen(PreTrainedModel):
         if input_ids is None:
             raise ValueError("input_ids must be provided for full forward pass")
             
-        # Create protein attention mask (all 1s since protein embeddings are valid)
-        protein_attention_mask = torch.ones(
-            (adapted_embeddings.shape[0], adapted_embeddings.shape[1]),
-            dtype=torch.long,
-            device=input_ids.device
-        )
+        # Use the protein attention mask returned by encode_protein_sequences
+        # (no need to create a new one since we now have proper masking for padded positions)
         
         # Prepare decoder inputs with placeholder replacement
         inputs_embeds, final_attention_mask = self.prepare_decoder_inputs(
