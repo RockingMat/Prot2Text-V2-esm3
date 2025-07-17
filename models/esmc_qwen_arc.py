@@ -20,7 +20,9 @@ from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from esm.models.esmc import ESMC
-from esm.sdk.api import ESMProtein, LogitsConfig
+from esm.sdk.api import ESMProteinTensor, LogitsConfig
+from esm.utils import encoding
+from esm.utils.misc import stack_variable_length_tensors
 
 from .esmc_config import ESMCConfig
 from .modeling_esm2llama_instruct import ModalityAdapter
@@ -44,7 +46,12 @@ class ESMCQwen(PreTrainedModel):
 
     def encode_protein_sequences(self, protein_sequences: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode protein sequences using ESM C.
+        Encode protein sequences using ESM C
+
+        1. Tokenize sequences individually using the tokenizer
+        2. Batch with padding using stack_variable_length_tensors 
+        3. Create ESMProteinTensor with batched token IDs
+        4. Get embeddings from the tensor (not individual sequences)
         
         Args:
             protein_sequences: List of protein sequences (strings)
@@ -54,67 +61,37 @@ class ESMCQwen(PreTrainedModel):
             - protein_embeddings: tensor (batch_size, seq_len, hidden_size)
             - attention_mask: tensor (batch_size, seq_len) with 1 for valid positions, 0 for padded
         """
-        # Convert to ESMProtein objects
-        proteins = [ESMProtein(sequence=seq) for seq in protein_sequences]
+        pad_token_id = self.esm_encoder.tokenizer.pad_token_id
+        assert pad_token_id is not None
         
-        # Encode each protein
-        protein_tensors = [self.esm_encoder.encode(protein) for protein in proteins]
+        # Step 1: Tokenize each sequence to get token IDs
+        # This uses the same approach as ESMC's _tokenize method
+        tokenized_sequences = [
+            encoding.tokenize_sequence(seq, self.esm_encoder.tokenizer, add_special_tokens=True)
+            for seq in protein_sequences
+        ]
         
-        # Get embeddings using logits API
-        batch_embeddings = []
-        original_lengths = []
-        for protein_tensor in protein_tensors:
-            logits_output = self.esm_encoder.logits(
-                protein_tensor, 
-                LogitsConfig(sequence=True, return_embeddings=True)
-            )
-            batch_embeddings.append(logits_output.embeddings)
-            original_lengths.append(logits_output.embeddings.shape[1])
+        # Step 2: Batch with padding using ESMC's built-in approach
+        # This pads with pad_token_id (not zeros) and uses FlashAttention internally
+        batched_token_ids = stack_variable_length_tensors(
+            tokenized_sequences,
+            constant_value=pad_token_id,
+        ).to(next(self.esm_encoder.parameters()).device)
         
-        # Pad embeddings to the same length
-        if len(batch_embeddings) > 1:
-            # Find the maximum sequence length
-            max_seq_len = max(emb.shape[1] for emb in batch_embeddings)
-            hidden_size = batch_embeddings[0].shape[2]
-            
-            # Pad each embedding to max_seq_len and create attention masks
-            padded_embeddings = []
-            attention_masks = []
-            for emb, orig_len in zip(batch_embeddings, original_lengths):
-                seq_len = emb.shape[1]
-                if seq_len < max_seq_len:
-                    # Pad with zeros
-                    padding = torch.zeros(
-                        (1, max_seq_len - seq_len, hidden_size),
-                        dtype=emb.dtype,
-                        device=emb.device
-                    )
-                    padded_emb = torch.cat([emb, padding], dim=1)
-                    padded_embeddings.append(padded_emb)
-                    
-                    # Create attention mask: 1 for valid positions, 0 for padded
-                    mask = torch.cat([
-                        torch.ones(orig_len, dtype=torch.long, device=emb.device),
-                        torch.zeros(max_seq_len - orig_len, dtype=torch.long, device=emb.device)
-                    ])
-                    attention_masks.append(mask)
-                else:
-                    padded_embeddings.append(emb)
-                    mask = torch.ones(orig_len, dtype=torch.long, device=emb.device)
-                    attention_masks.append(mask)
-            
-            # Stack the padded embeddings and attention masks
-            encoder_hidden_states = torch.stack(padded_embeddings, dim=0)
-            attention_mask = torch.stack(attention_masks, dim=0)
-        else:
-            # Single sequence case
-            encoder_hidden_states = torch.stack(batch_embeddings, dim=0)
-            attention_mask = torch.ones(
-                (1, batch_embeddings[0].shape[1]), 
-                dtype=torch.long, 
-                device=batch_embeddings[0].device
-            )
+        # Step 3: Create protein tensor and get embeddings
+        protein_tensor = ESMProteinTensor(sequence=batched_token_ids)
         
+        # Step 4: Get embeddings using logits API
+        logits_output = self.esm_encoder.logits(
+            protein_tensor, 
+            LogitsConfig(sequence=True, return_embeddings=True)
+        )
+        
+        # Step 5: Create attention mask (1 for valid positions, 0 for padded)
+        attention_mask = (batched_token_ids != pad_token_id).long()
+        
+        # Step 6: Get embeddings and ensure proper dtype
+        encoder_hidden_states = logits_output.embeddings
         adapter_dtype = next(self.adapter.parameters()).dtype
         encoder_hidden_states = encoder_hidden_states.to(adapter_dtype)
         
