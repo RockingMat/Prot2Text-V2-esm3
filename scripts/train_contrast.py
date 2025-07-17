@@ -1,6 +1,6 @@
 """
-Stage 1 - contrastive learning training script for ESM-LLAMA modality alignment 
-on Esm2LlamaInstructForCausalLM model. 
+Stage 1 - contrastive learning training script for ESM-C + Qwen modality alignment 
+on ESMCQwen model. 
 
 Without LoRA. 
 
@@ -33,7 +33,6 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, PreTrainedModel
-from transformers import EsmModel, LlamaModel, LlamaForCausalLM
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
@@ -49,29 +48,31 @@ import scripts.utils_argparse as utils_argparse
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
-argParser.add_argument("--llama_path", type=str)
-# Note: root_dataset_dir is no longer needed with lightweight dataloader
-argParser.add_argument("--root_csv_dir", type=str)
-argParser.add_argument("--save_checkpoint_dir", type=str)
-argParser.add_argument("--load_model_checkpoint_path", type=str, default="")
-argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
+# Required arguments
+argParser.add_argument("--root_csv_dir", type=str, required=True, help="Directory containing train/eval CSV files")
+argParser.add_argument("--save_checkpoint_dir", type=str, required=True, help="Directory to save checkpoints")
 
-argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype)
-argParser.add_argument("--batch_size_per_device", type=int)
-argParser.add_argument("--num_epochs", type=int)
-argParser.add_argument("--save_every_epochs", type=int)
-argParser.add_argument("--gradient_accumulation_steps", type=int)
-argParser.add_argument("--learning_rate", type=float)
-argParser.add_argument("--gradient_clipping", type=float, default=None)
-argParser.add_argument("--scheduler_gamma", type=float)
-argParser.add_argument("--random_seed", type=int)
-argParser.add_argument("--contrastive_num_segments", type=int)
+# Optional checkpoint loading
+argParser.add_argument("--load_model_checkpoint_path", type=str, default="", help="Path to model checkpoint to load")
+argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="", help="Path to optimizer/scheduler checkpoint to load")
 
-argParser.add_argument("--train_split", type=str)
-argParser.add_argument("--eval_split", type=str)
-argParser.add_argument("--debug_trim_train_split", type=int, default=None)
-argParser.add_argument("--debug_trim_eval_split", type=int, default=None)
+# Training hyperparameters with sensible defaults
+argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="float16", help="Training dtype (default: float16)")
+argParser.add_argument("--batch_size_per_device", type=int, default=8, help="Batch size per device (default: 8)")
+argParser.add_argument("--num_epochs", type=int, default=5, help="Number of training epochs (default: 5)")
+argParser.add_argument("--save_every_epochs", type=int, default=1, help="Save checkpoint every N epochs (default: 1)")
+argParser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps (default: 1)")
+argParser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
+argParser.add_argument("--gradient_clipping", type=float, default=None, help="Gradient clipping threshold (default: None)")
+argParser.add_argument("--scheduler_gamma", type=float, default=0.99, help="Scheduler gamma (default: 0.99)")
+argParser.add_argument("--random_seed", type=int, default=42, help="Random seed (default: 42)")
+argParser.add_argument("--contrastive_num_segments", type=int, default=2, help="Number of contrastive segments (default: 2)")
+
+# Dataset splits with defaults
+argParser.add_argument("--train_split", type=str, default="train", help="Training split name (default: train)")
+argParser.add_argument("--eval_split", type=str, default="validation", help="Evaluation split name (default: validation)")
+argParser.add_argument("--debug_trim_train_split", type=int, default=None, help="Trim training dataset for debugging")
+argParser.add_argument("--debug_trim_eval_split", type=int, default=None, help="Trim evaluation dataset for debugging")
 
 
 class BatchInfoNCELoss(torch.nn.Module):
@@ -158,9 +159,8 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
         adapter_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="auto",  # load to CPU first
+            map_location="auto",
             low_cpu_mem_usage=True
-            # will be loaded to where the weights were saved from if not specified
         )
         model.adapter.load_state_dict(adapter_state_dict)
 
@@ -225,55 +225,63 @@ def readout_embeddings(
 
 
 def get_sequence_embeddings(
-        model: Esm2LlamaInstructForCausalLM, 
-        sequence_input_ids: torch.Tensor, 
-        sequence_attention_mask: torch.Tensor,
+        model: ESMCQwen, 
+        protein_sequences: list,
 ) -> torch.Tensor:
     """
     Take mean pooling and the std pooling of the adapter outputs for each valid 
     token in the sequence as the sequence embedding for contrastive learning. 
 
-    sequence_input_ids: (bsz, max_seq_len)
-    sequence_attention_mask: (bsz, max_seq_len)
+    protein_sequences: List of raw protein sequences
     return: (bsz, decoder_hidden_size)
     """
     with torch.no_grad():  # WARNING: esm encoder fixed
         encoder_output = model.forward(
-            protein_input_ids=sequence_input_ids,
-            protein_attention_mask=sequence_attention_mask,
+            protein_sequences=protein_sequences,
             return_encoder_outputs=True,
         )
 
-    adapter_output = model.adapter(encoder_output[0])
-    protein_attention_mask = sequence_attention_mask
-    # adapter_output: (bsz, max_seq_len, decoder_hidden_size)
+    adapter_output = encoder_output[0]  # (bsz, max_seq_len, decoder_hidden_size)
+    
+    # Create attention mask based on sequence lengths (all positions are valid for raw sequences)
+    batch_size, seq_len = adapter_output.shape[:2]
+    attention_mask = torch.ones(
+        (batch_size, seq_len), 
+        dtype=torch.long, 
+        device=adapter_output.device
+    )
 
     return readout_embeddings(
         embeddings=adapter_output, 
-        attention_mask=protein_attention_mask, 
+        attention_mask=attention_mask, 
         readout_fn="mix"
     )  # (bsz, decoder_hidden_size)
 
 
 def get_description_embeddings(
-        model: Esm2LlamaInstructForCausalLM,
+        model: ESMCQwen,
         description_input_ids: torch.Tensor,
         description_attention_mask: torch.Tensor,
-        output_llama_layer: int = 16,
+        output_llm_layer: int = 16,
 ) -> torch.Tensor:
-    """Take output corresponding to eot_token in the description. """
-    llama_model: LlamaModel = model.llama_decoder.model
-    hidden_states = llama_model(
-        input_ids=description_input_ids,
-        attention_mask=description_attention_mask,
-        use_cache=False, 
-        output_attentions=False, 
-        output_hidden_states=True, 
-        return_dict=False,
-    )[1]  # (bsz, max_desc_len, hidden_dim)
+    """Extract embeddings from the Qwen 14B decoder for description text."""
+    with torch.no_grad():  # WARNING: llm decoder fixed during contrastive training
+        qwen_model = model.llm_decoder.model
+        
+        outputs = qwen_model(
+            input_ids=description_input_ids,
+            attention_mask=description_attention_mask,
+            use_cache=False, 
+            output_attentions=False, 
+            output_hidden_states=True, 
+            return_dict=True,
+        )
+        
+        # Extract hidden states from the specified layer
+        hidden_states = outputs.hidden_states[output_llm_layer]
 
     return readout_embeddings(
-        embeddings=hidden_states[output_llama_layer],
+        embeddings=hidden_states,
         attention_mask=description_attention_mask,
         readout_fn="mix"
     )  # (bsz, decoder_hidden_size)
@@ -295,8 +303,7 @@ def teacher_forcing_forward_pass(
     Due to the memory limit on GPUs, the similarity matrix will be computed in 
     segments, and the loss will be averaged over the segments.
     """
-    protein_input_ids = data_batch["protein_input_ids"].to(rank)
-    protein_attention_mask = data_batch["protein_attention_mask"].to(rank)
+    protein_sequences = data_batch["protein_sequences"]  # List of raw sequences
     description_input_ids = data_batch["description_input_ids"].to(rank)
     description_attention_mask = data_batch["description_attention_mask"].to(rank)
 
@@ -304,7 +311,7 @@ def teacher_forcing_forward_pass(
     if isinstance(model, DistributedDataParallel):
         base_model = model.module
 
-    batch_size = protein_input_ids.size(0)
+    batch_size = len(protein_sequences)
     segment_size = batch_size // contrastive_num_segments
     if segment_size * contrastive_num_segments != batch_size:
         print(
@@ -324,18 +331,16 @@ def teacher_forcing_forward_pass(
         description_output = torch.nn.functional.normalize(description_output, p=2, dim=-1)
 
     for segment_id in range(contrastive_num_segments):
-        segment_protein_input_ids = protein_input_ids[
-            segment_id * segment_size:(segment_id + 1) * segment_size
-        ]
-        segment_protein_attention_mask = protein_attention_mask[
+        segment_protein_sequences = protein_sequences[
             segment_id * segment_size:(segment_id + 1) * segment_size
         ]
 
         segment_protein_output = get_sequence_embeddings(
             base_model, 
-            segment_protein_input_ids, 
-            segment_protein_attention_mask
+            segment_protein_sequences
         )
+        segment_protein_output = torch.nn.functional.normalize(segment_protein_output, p=2, dim=-1)
+        
         labels = torch.arange(
             segment_id * segment_size, 
             (segment_id + 1) * segment_size, 
@@ -498,9 +503,11 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        args["llama_path"], 
+    # For ESMCQwen: 
+    # - ESMC handles raw protein sequences (no tokenizer needed)
+    # - Qwen 14B handles text (use AutoTokenizer)
+    qwen_tokenizer = AutoTokenizer.from_pretrained(
+        ESMCConfig.llm_model_name,  # "Qwen/Qwen3-14B"
         pad_token='<|reserved_special_token_0|>'
     )
 
@@ -520,10 +527,11 @@ def train_on_device(
     )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
-        description_tokenizer=llama_tokenizer,
+        sequence_tokenizer=None,  # Not needed for raw sequences
+        description_tokenizer=qwen_tokenizer,  # Qwen tokenizer for text
         mode="train",
         include_text_fields=True,
+        use_raw_sequences=True,  # Use raw sequences for ESMCQwen
     )
     
     train_loader = torch.utils.data.DataLoader(
@@ -554,10 +562,11 @@ def train_on_device(
     )
     
     eval_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
-        description_tokenizer=llama_tokenizer,
+        sequence_tokenizer=None,  # Not needed for raw sequences
+        description_tokenizer=qwen_tokenizer,  # Qwen tokenizer for text
         mode="train",  # Use train mode for contrastive learning (need both sequences and descriptions)
         include_text_fields=True,
+        use_raw_sequences=True,  # Use raw sequences for ESMCQwen
     )
     
     eval_loader = torch.utils.data.DataLoader(
@@ -675,6 +684,14 @@ if __name__ == '__main__':
     os.environ["LOGURU_LEVEL"] = "INFO"
 
     parsed_args = argParser.parse_args()
+    
+    # Print help information about model paths
+    print("####################")
+    print("ESMCQwen Contrastive Training")
+    print(f"Using ESM model: {ESMCConfig.esm_model_name}")
+    print(f"Using LLM model: {ESMCConfig.llm_model_name}")
+    print("####################")
+    
     # os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # restrict GPU visibility
     parsed_args.world_size = torch.cuda.device_count()  # use up all visible GPUs
 
@@ -691,6 +708,7 @@ if __name__ == '__main__':
         os.mkdir(parsed_args.save_checkpoint_dir)
     
     print("####################")
+    print("Training Configuration:")
     for key, value in parsed_args.__dict__.items(): 
         print(f"{key}: {value}")
     print("####################")
