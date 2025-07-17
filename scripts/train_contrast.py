@@ -129,7 +129,6 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     A general checkpoint shall contain the model state dict, optimizer state dict,
     and scheduler state dict.
     """
-    esm_cfg = EsmConfig.from_pretrained(ESMCConfig.esm_model_name)
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
     esm_encoder = esm_encoder.to(args["torch_dtype"])
 
@@ -141,14 +140,13 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     )
 
     adapter_config = ModalityAdapterConfig(
-        input_dim=esm_cfg.hidden_size,
+        input_dim=esm_encoder.embed.embedding_dim,
         intermediate_dim=2048,
         output_dim=llm_decoder.config.hidden_size,
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
     model_cfg = ESMCConfig(
-        esm_config=esm_cfg,
         adapter_config=adapter_config,
         llm_config=llm_decoder.config,
     )
