@@ -130,7 +130,6 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     and scheduler state dict.
     """
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
-    esm_encoder = esm_encoder.to(args["torch_dtype"])
 
     llm_decoder = AutoModelForCausalLM.from_pretrained(
         ESMCConfig.llm_model_name,

@@ -115,6 +115,9 @@ class ESMCQwen(PreTrainedModel):
                 device=batch_embeddings[0].device
             )
         
+        adapter_dtype = next(self.adapter.parameters()).dtype
+        encoder_hidden_states = encoder_hidden_states.to(adapter_dtype)
+        
         return encoder_hidden_states, attention_mask
 
     def prepare_decoder_inputs(
