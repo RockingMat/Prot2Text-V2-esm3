@@ -78,6 +78,20 @@ class ESMCQwen(PreTrainedModel):
             constant_value=pad_token_id,
         ).to(next(self.esm_encoder.parameters()).device)
         
+        # Debug: Validate batched_token_ids structure for ESMC.logits() call
+        print(f"DEBUG: batched_token_ids shape: {batched_token_ids.shape}")
+        print(f"DEBUG: batched_token_ids dtype: {batched_token_ids.dtype}")
+        print(f"DEBUG: pad_token_id: {pad_token_id}")
+        print(f"DEBUG: Batch size: {batched_token_ids.shape[0]}, Max seq length: {batched_token_ids.shape[1]}")
+        
+        # Verify padding is correct
+        for i in range(batched_token_ids.shape[0]):
+            non_pad_count = (batched_token_ids[i] != pad_token_id).sum().item()
+            print(f"  Seq {i}: {non_pad_count} non-pad tokens / {batched_token_ids.shape[1]} total")
+            if non_pad_count > 0:
+                print(f"    First 5 tokens: {batched_token_ids[i][:5].tolist()}")
+                print(f"    Last 5 tokens: {batched_token_ids[i][-5:].tolist()}")
+        
         # Step 3: Create protein tensor and get embeddings
         protein_tensor = ESMProteinTensor(sequence=batched_token_ids)
         
@@ -106,7 +120,6 @@ class ESMCQwen(PreTrainedModel):
     ):
         """
         Embed and replace placeholder in `input_ids` by encoder hidden states.
-        This method follows the same pattern as ESM2LlamaInstruct for consistency.
         
         Args:
             input_ids: Token IDs containing placeholder tokens
