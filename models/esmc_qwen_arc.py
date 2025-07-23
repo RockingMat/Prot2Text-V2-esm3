@@ -1,12 +1,12 @@
 """
-ESM C → ModalityAdapter → Qwen3-14B (or any HF CausalLM) in one class.
+ESM C → ModalityAdapter → Qwen2.5-14B (or any HF CausalLM) in one class.
 
 Pipeline:
 1. Raw protein sequences → ESM C encoder → protein embeddings
 2. Protein embeddings → ModalityAdapter → aligned embeddings  
 3. Text with placeholder tokens → LLM embeddings
 4. Replace placeholder tokens with aligned protein embeddings
-5. Combined embeddings → Qwen3-14B → text output
+5. Combined embeddings → Qwen2.5-14B → text output
 """
 
 from typing import Optional, Union, List, Tuple
@@ -186,7 +186,7 @@ class ESMCQwen(PreTrainedModel):
         **kwargs,
     ) -> Union[tuple, CausalLMOutputWithPast]:
         """
-        Simple forward pass: protein sequences → ESM C → adapter → Qwen3-14B
+        Simple forward pass: protein sequences → ESM C → adapter → Qwen2.5-14B
         
         Args:
             protein_sequences: Raw protein sequences (required)

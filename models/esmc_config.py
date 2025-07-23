@@ -5,7 +5,7 @@ from .modality_config import ModalityAdapterConfig
 class ESMCConfig(PretrainedConfig):
     """Configuration for ESM Cambrian + LLM model."""
     model_type = "esmC_llama_instruct"
-    llm_model_name: str = "Qwen/Qwen3-14B"
+    llm_model_name: str = "Qwen/Qwen2.5-14B-Instruct"
     esm_model_name: str = "esmc_600m"
     
     def __init__(
