@@ -20,8 +20,9 @@ from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
 
 from esm.models.esmc import ESMC
-from esm.sdk.api import ESMProteinTensor, LogitsConfig
+from esm.sdk.api import LogitsConfig
 from esm.utils import encoding
+from esm.utils.sampling import _BatchedESMProteinTensor
 from esm.utils.misc import stack_variable_length_tensors
 
 from .esmc_config import ESMCConfig
@@ -93,7 +94,7 @@ class ESMCQwen(PreTrainedModel):
                 print(f"    Last 5 tokens: {batched_token_ids[i][-5:].tolist()}")
         
         # Step 3: Create protein tensor and get embeddings
-        protein_tensor = ESMProteinTensor(sequence=batched_token_ids)
+        protein_tensor = _BatchedESMProteinTensor(sequence=batched_token_ids)
         
         # Step 4: Get embeddings using logits API
         logits_output = self.esm_encoder.logits(
