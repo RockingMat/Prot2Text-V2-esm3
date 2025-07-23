@@ -1,12 +1,12 @@
 """
-ESM C → ModalityAdapter → Qwen2.5-14B (or any HF CausalLM) in one class.
+ESM C → ModalityAdapter → Qwen3-14B (or any HF CausalLM) in one class.
 
 Pipeline:
 1. Raw protein sequences → ESM C encoder → protein embeddings
 2. Protein embeddings → ModalityAdapter → aligned embeddings  
 3. Text with placeholder tokens → LLM embeddings
 4. Replace placeholder tokens with aligned protein embeddings
-5. Combined embeddings → Qwen2.5-14B → text output
+5. Combined embeddings → Qwen3-14B → text output
 """
 
 from typing import Optional, Union, List, Tuple
@@ -63,41 +63,21 @@ class ESMCQwen(PreTrainedModel):
         pad_token_id = self.esm_encoder.tokenizer.pad_token_id
         assert pad_token_id is not None
         
-        # Step 1: Tokenize each sequence to get token IDs
         # This uses the same approach as ESMC's _tokenize method
         tokenized_sequences = [
             encoding.tokenize_sequence(seq, self.esm_encoder.tokenizer, add_special_tokens=True)
             for seq in protein_sequences
         ]
         
-        # Step 2: Batch with padding using ESMC's built-in approach
-        # This pads with pad_token_id (not zeros) and uses FlashAttention internally
         batched_token_ids = stack_variable_length_tensors(
             tokenized_sequences,
             constant_value=pad_token_id,
         ).to(next(self.esm_encoder.parameters()).device)
         
-        # Debug: Validate batched_token_ids structure for ESMC.logits() call
-        print(f"DEBUG: batched_token_ids shape: {batched_token_ids.shape}")
-        print(f"DEBUG: batched_token_ids dtype: {batched_token_ids.dtype}")
-        print(f"DEBUG: pad_token_id: {pad_token_id}")
-        print(f"DEBUG: Batch size: {batched_token_ids.shape[0]}, Max seq length: {batched_token_ids.shape[1]}")
-        
-        # Verify padding is correct
-        for i in range(batched_token_ids.shape[0]):
-            non_pad_count = (batched_token_ids[i] != pad_token_id).sum().item()
-            print(f"  Seq {i}: {non_pad_count} non-pad tokens / {batched_token_ids.shape[1]} total")
-            if non_pad_count > 0:
-                print(f"    First 5 tokens: {batched_token_ids[i][:5].tolist()}")
-                print(f"    Last 5 tokens: {batched_token_ids[i][-5:].tolist()}")
-        
-        # Step 4: Get embeddings using logits API
         output = self.esm_encoder.forward(sequence_tokens=batched_token_ids)
 
-        # Step 5: Create attention mask (1 for valid positions, 0 for padded)
         attention_mask = (batched_token_ids != pad_token_id).long()
         
-        # Step 6: Get embeddings and ensure proper dtype
         encoder_hidden_states = output.embeddings
         adapter_dtype = next(self.adapter.parameters()).dtype
         encoder_hidden_states = encoder_hidden_states.to(adapter_dtype)
@@ -179,7 +159,7 @@ class ESMCQwen(PreTrainedModel):
         **kwargs,
     ) -> Union[tuple, CausalLMOutputWithPast]:
         """
-        Simple forward pass: protein sequences → ESM C → adapter → Qwen2.5-14B
+        Simple forward pass: protein sequences → ESM C → adapter → Qwen3-14B
         
         Args:
             protein_sequences: Raw protein sequences (required)
