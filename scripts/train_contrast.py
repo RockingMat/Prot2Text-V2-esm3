@@ -238,11 +238,10 @@ def get_sequence_embeddings(
     protein_sequences: List of raw protein sequences
     return: (bsz, decoder_hidden_size)
     """
-    with torch.no_grad():  # WARNING: esm encoder fixed
-        encoder_output = model.forward(
-            protein_sequences=protein_sequences,
-            return_encoder_outputs=True,
-        )
+    encoder_output = model.forward(
+        protein_sequences=protein_sequences,
+        return_encoder_outputs=True,
+    )
 
     adapter_output = encoder_output[0]  # (bsz, max_seq_len, decoder_hidden_size)
     
