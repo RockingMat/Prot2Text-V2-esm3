@@ -241,6 +241,14 @@ def readout_embeddings(
         diff_embeddings = embeddings - mean_embeddings.unsqueeze(1)
             # (bsz, text_len, hidden_dim)
         diff_embeddings_2 = diff_embeddings.pow(2) 
+        
+        # Debug: Check for inf after squaring differences
+        if torch.isinf(diff_embeddings_2).any():
+            print(f"INF detected in diff_embeddings_2 (squared differences)")
+            print(f"  Max diff before squaring: {torch.abs(diff_embeddings).max().item():.2e}")
+            print(f"  Max embeddings: {torch.abs(embeddings).max().item():.2e}")
+            print(f"  Max mean_embeddings: {torch.abs(mean_embeddings).max().item():.2e}")
+        
         masked_diff_embeddings_2 = diff_embeddings_2 * attention_mask.unsqueeze(-1)
         sum_diff_embeddings_2 = masked_diff_embeddings_2.sum(dim=1)  # (bsz, hidden_dim)
         count_attn_mask = attention_mask.sum(dim=1, keepdim=True)  # (bsz, 1)
@@ -251,6 +259,11 @@ def readout_embeddings(
         
         variance = sum_diff_embeddings_2 / count_attn_mask
         
+        # Debug: Check for inf in variance
+        if torch.isinf(variance).any():
+            print(f"INF detected in variance calculation")
+            print(f"  Max sum_diff_embeddings_2: {sum_diff_embeddings_2.max().item():.2e}")
+        
         # Debug: Check if sqrt input contains zeros or negative values
         if torch.any(variance == 0):
             print(f"std readout sqrt input contains zeros")
@@ -258,6 +271,10 @@ def readout_embeddings(
             print(f"std readout sqrt input contains negative values")
             
         result = variance.sqrt()  # (bsz, hidden_dim)
+        
+        # Debug: Check for inf after sqrt
+        if torch.isinf(result).any():
+            print(f"INF detected in std readout result after sqrt")
         
         # Debug print only if NaN detected
         if torch.isnan(result).any():
