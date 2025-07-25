@@ -113,7 +113,15 @@ class SegmentedBatchInfoNCELoss(torch.nn.Module):
         numerator = torch.exp(logits[torch.arange(segment_size), labels]).unsqueeze(1)  # (segment_size, 1)
         denominator = torch.sum(torch.exp(logits), dim=1, keepdim=True)  # (segment_size, 1)
         
-        return - torch.log(numerator / denominator).mean()
+        loss = - torch.log(numerator / denominator).mean()
+        
+        # Debug print only if NaN detected
+        if torch.isnan(loss):
+            print(f"DEBUG NaN: denominator_zeros={torch.any(denominator == 0).item()}, "
+                  f"logits_range=[{logits.min().item():.2f}, {logits.max().item():.2f}], "
+                  f"numerator_zeros={torch.any(numerator == 0).item()}")
+        
+        return loss
 
 
 def load_model(args: Dict[str, Any]) -> PreTrainedModel:
@@ -195,7 +203,13 @@ def readout_embeddings(
         masked_embeddings = embeddings * attention_mask.unsqueeze(-1)
         sum_embeddings = masked_embeddings.sum(dim=1)  # (bsz, hidden_dim)
         count_attn_mask = attention_mask.sum(dim=1, keepdim=True)  # (bsz, 1)
-        return sum_embeddings / count_attn_mask  # (bsz, hidden_dim)
+        result = sum_embeddings / count_attn_mask  # (bsz, hidden_dim)
+        
+        # Debug print only if NaN detected
+        if torch.isnan(result).any():
+            print(f"DEBUG NaN in mean readout: count_attn_mask_zeros={torch.any(count_attn_mask == 0).item()}")
+        
+        return result
     
     elif readout_fn == "std":
         mean_embeddings = readout_embeddings(
@@ -209,7 +223,15 @@ def readout_embeddings(
         masked_diff_embeddings_2 = diff_embeddings_2 * attention_mask.unsqueeze(-1)
         sum_diff_embeddings_2 = masked_diff_embeddings_2.sum(dim=1)  # (bsz, hidden_dim)
         count_attn_mask = attention_mask.sum(dim=1, keepdim=True)  # (bsz, 1)
-        return (sum_diff_embeddings_2 / count_attn_mask).sqrt()  # (bsz, hidden_dim)
+        result = (sum_diff_embeddings_2 / count_attn_mask).sqrt()  # (bsz, hidden_dim)
+        
+        # Debug print only if NaN detected
+        if torch.isnan(result).any():
+            variance = sum_diff_embeddings_2 / count_attn_mask
+            print(f"DEBUG NaN in std readout: count_attn_mask_zeros={torch.any(count_attn_mask == 0).item()}, "
+                  f"negative_variance={torch.any(variance < 0).item()}")
+        
+        return result
 
     elif readout_fn == "mix": 
         mean_embeddings = readout_embeddings(
@@ -322,7 +344,16 @@ def teacher_forcing_forward_pass(
             description_input_ids, 
             description_attention_mask
         )
+        
+        # Debug print only if NaN detected before normalization
+        if torch.isnan(description_output).any():
+            print(f"DEBUG NaN in description_output before normalization")
+        
         description_output = torch.nn.functional.normalize(description_output, p=2, dim=-1)
+        
+        # Debug print only if NaN detected after normalization
+        if torch.isnan(description_output).any():
+            print(f"DEBUG NaN in description_output after normalization (zero vectors present)")
 
     for segment_id in range(contrastive_num_segments):
         segment_protein_input_ids = protein_input_ids[
@@ -337,19 +368,32 @@ def teacher_forcing_forward_pass(
             segment_protein_input_ids, 
             segment_protein_attention_mask
         )
+        
+        # Debug print only if NaN detected in protein embeddings
+        if torch.isnan(segment_protein_output).any():
+            print(f"DEBUG NaN in segment_protein_output for segment {segment_id}")
+        
         labels = torch.arange(
             segment_id * segment_size, 
             (segment_id + 1) * segment_size, 
             device=rank
         )
 
-        acc_loss += loss_fn(
+        segment_loss = loss_fn(
             segment_output1=segment_protein_output, 
             batch_output2=description_output, 
             labels=labels
         )
+        
+        acc_loss += segment_loss
 
-    return acc_loss / contrastive_num_segments
+    final_loss = acc_loss / contrastive_num_segments
+    
+    # Debug print only if final loss is NaN
+    if torch.isnan(final_loss):
+        print(f"DEBUG NaN in final averaged loss: acc_loss={acc_loss.item()}, num_segments={contrastive_num_segments}")
+    
+    return final_loss
 
 
 def setup(rank: int, world_size: int):
