@@ -110,8 +110,20 @@ class SegmentedBatchInfoNCELoss(torch.nn.Module):
         similarity_matrix = torch.mm(segment_output1, batch_output2.t())
         logits = similarity_matrix / self.temperature  # (segment_size, bsz)
         
+        # Debug: Check for extreme logits that could cause overflow
+        if torch.any(logits > 50) or torch.any(logits < -50):
+            print(f"DEBUG: Extreme logits detected, range=[{logits.min().item():.2f}, {logits.max().item():.2f}]")
+        
         numerator = torch.exp(logits[torch.arange(segment_size), labels]).unsqueeze(1)  # (segment_size, 1)
         denominator = torch.sum(torch.exp(logits), dim=1, keepdim=True)  # (segment_size, 1)
+        
+        # Debug: Check for zero denominators before division
+        if torch.any(denominator == 0):
+            print(f"DEBUG: Zero denominators detected in loss function")
+        
+        # Debug: Check for zero numerators
+        if torch.any(numerator == 0):
+            print(f"DEBUG: Zero numerators detected in loss function")
         
         loss = - torch.log(numerator / denominator).mean()
         
@@ -189,6 +201,10 @@ def readout_embeddings(
     Perform a readout operation on the output sequence embeddings of the forward 
     pass, given the attention mask. 
     """
+    # Debug: Check if input embeddings contain NaN
+    if torch.isnan(embeddings).any():
+        print(f"DEBUG: Input embeddings contain NaN in readout_embeddings (fn={readout_fn})")
+    
     if readout_fn == "last":
         # inputs must be right padded
         # for left padding simply take the last token and do not use this function
@@ -203,6 +219,11 @@ def readout_embeddings(
         masked_embeddings = embeddings * attention_mask.unsqueeze(-1)
         sum_embeddings = masked_embeddings.sum(dim=1)  # (bsz, hidden_dim)
         count_attn_mask = attention_mask.sum(dim=1, keepdim=True)  # (bsz, 1)
+        
+        # Debug: Check for zero denominators before division
+        if torch.any(count_attn_mask == 0):
+            print(f"DEBUG: mean readout has zero denominator (empty attention masks)")
+        
         result = sum_embeddings / count_attn_mask  # (bsz, hidden_dim)
         
         # Debug print only if NaN detected
@@ -223,11 +244,23 @@ def readout_embeddings(
         masked_diff_embeddings_2 = diff_embeddings_2 * attention_mask.unsqueeze(-1)
         sum_diff_embeddings_2 = masked_diff_embeddings_2.sum(dim=1)  # (bsz, hidden_dim)
         count_attn_mask = attention_mask.sum(dim=1, keepdim=True)  # (bsz, 1)
-        result = (sum_diff_embeddings_2 / count_attn_mask).sqrt()  # (bsz, hidden_dim)
+        
+        # Debug: Check for zero denominators and sqrt input
+        if torch.any(count_attn_mask == 0):
+            print(f"DEBUG: std readout has zero denominator (empty attention masks)")
+        
+        variance = sum_diff_embeddings_2 / count_attn_mask
+        
+        # Debug: Check if sqrt input contains zeros or negative values
+        if torch.any(variance == 0):
+            print(f"DEBUG: std readout sqrt input contains zeros")
+        if torch.any(variance < 0):
+            print(f"DEBUG: std readout sqrt input contains negative values")
+            
+        result = variance.sqrt()  # (bsz, hidden_dim)
         
         # Debug print only if NaN detected
         if torch.isnan(result).any():
-            variance = sum_diff_embeddings_2 / count_attn_mask
             print(f"DEBUG NaN in std readout: count_attn_mask_zeros={torch.any(count_attn_mask == 0).item()}, "
                   f"negative_variance={torch.any(variance < 0).item()}")
         
@@ -304,6 +337,10 @@ def get_description_embeddings(
         output_hidden_states=True, 
         return_dict=False,
     )[1]  # (bsz, max_desc_len, hidden_dim)
+
+    # Debug: Check if LLAMA output contains NaN
+    if torch.isnan(hidden_states[output_llama_layer]).any():
+        print(f"DEBUG: LLAMA hidden states contain NaN at layer {output_llama_layer}")
 
     return readout_embeddings(
         embeddings=hidden_states[output_llama_layer],
@@ -388,6 +425,11 @@ def teacher_forcing_forward_pass(
             print(f"DEBUG: Found {zero_mask.sum().item()} zero vectors in description_output")
             # Replace zero vectors with small random values to avoid NaN
             description_output[zero_mask] = torch.randn_like(description_output[zero_mask]) * 1e-6
+        
+        # Debug: Check if normalize input has very small norms that could cause issues
+        very_small_norms = (norms < 1e-8) & (norms > 0)
+        if very_small_norms.any():
+            print(f"DEBUG: Found {very_small_norms.sum().item()} very small norms in description_output")
         
         description_output = torch.nn.functional.normalize(description_output, p=2, dim=-1)
         
