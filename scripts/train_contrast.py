@@ -54,7 +54,7 @@ argParser.add_argument("--save_checkpoint_dir", type=str, default="./checkpoints
 argParser.add_argument("--load_model_checkpoint_path", type=str, default="")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
 
-argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="float16")
+argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="float32")
 argParser.add_argument("--batch_size_per_device", type=int, default=8)
 argParser.add_argument("--num_epochs", type=int, default=12)
 argParser.add_argument("--save_every_epochs", type=int, default=1)
@@ -95,7 +95,7 @@ class BatchInfoNCELoss(torch.nn.Module):
 
 class SegmentedBatchInfoNCELoss(torch.nn.Module):
     """Segmented version of BatchInfoNCELoss for contrastive learning."""
-    def __init__(self, temperature: float = 0.05):
+    def __init__(self, temperature: float = 0.2):
         super().__init__()
         self.temperature = temperature
 
@@ -413,8 +413,19 @@ def train_epoch(
 
         # scale the loss up by a large factor to prevent them from becoming too small
         # then accumulate the scaled grads
+        
+        # Safety check for NaN in loss
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"WARNING: NaN or Inf detected in loss at batch {batch_idx}, skipping backward pass")
+            continue
+            
         loss.backward()  
             # backward out of autocast, but still uses same dtype as for forward
+
+        # Safety check for NaN in gradients
+        for name, param in model.named_parameters():
+            if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                print(f"WARNING: NaN or Inf detected in gradients for {name}")
 
         # update weights by loss if accumulation step is reached
         if (batch_idx + 1) % args["gradient_accumulation_steps"] == 0: 
