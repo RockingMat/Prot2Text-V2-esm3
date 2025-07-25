@@ -629,7 +629,7 @@ def train_on_device(
     # Debug: Check the raw data quality
     if rank == 0:
         print(f"DEBUG: Dataset size: {len(train_dataset.data)}")
-        sample_data = train_dataset.data[:3]  # Check first 3 samples
+        sample_data = [train_dataset[i] for i in range(min(3, len(train_dataset)))]  # Check first 3 samples
         for i, sample in enumerate(sample_data):
             print(f"  Sample {i}:")
             print(f"    Sequence length: {len(sample.get('sequence', ''))}")
@@ -658,7 +658,7 @@ def train_on_device(
     # Debug: Test the collater on a small sample
     if rank == 0:
         print("DEBUG: Testing collater with sample data...")
-        sample_batch = [train_dataset.data.iloc[i].to_dict() for i in range(min(2, len(train_dataset.data)))]
+        sample_batch = [train_dataset[i] for i in range(min(2, len(train_dataset)))]
         print(f"  Raw sample data keys: {list(sample_batch[0].keys())}")
         print(f"  Sample function: '{sample_batch[0].get('function', 'MISSING')}'")
         
