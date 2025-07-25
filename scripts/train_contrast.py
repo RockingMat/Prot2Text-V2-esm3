@@ -244,7 +244,17 @@ def readout_embeddings(
             attention_mask=attention_mask, 
             readout_fn="std"
         )
-        return torch.cat([mean_embeddings, std_embeddings], dim=1)  # (bsz, 2 * hidden_dim)
+        result = torch.cat([mean_embeddings, std_embeddings], dim=1)  # (bsz, 2 * hidden_dim)
+        
+        # Debug print only if we get zero vectors in mix mode
+        if torch.any(torch.norm(result, p=2, dim=-1) == 0):
+            zero_indices = torch.where(torch.norm(result, p=2, dim=-1) == 0)[0]
+            mask_sums = attention_mask.sum(dim=1)
+            print(f"DEBUG: Mix readout produced {len(zero_indices)} zero vectors")
+            print(f"  Zero vector indices: {zero_indices.tolist()}")
+            print(f"  Corresponding attention mask sums: {mask_sums[zero_indices].tolist()}")
+        
+        return result
 
 
 def get_sequence_embeddings(
@@ -323,6 +333,28 @@ def teacher_forcing_forward_pass(
     description_input_ids = data_batch["description_input_ids"].to(rank)
     description_attention_mask = data_batch["description_attention_mask"].to(rank)
 
+    # Debug data batch only if there are issues
+    desc_mask_sums = description_attention_mask.sum(dim=1)
+    prot_mask_sums = protein_attention_mask.sum(dim=1)
+    
+    if torch.any(desc_mask_sums == 0) or torch.any(prot_mask_sums == 0):
+        print(f"DEBUG DATA ISSUE:")
+        print(f"  Description attention mask sums: {desc_mask_sums.tolist()}")
+        print(f"  Protein attention mask sums: {prot_mask_sums.tolist()}")
+        print(f"  Description input_ids shape: {description_input_ids.shape}")
+        print(f"  Protein input_ids shape: {protein_input_ids.shape}")
+        print(f"  Description input_ids sample: {description_input_ids[0][:10].tolist()}")
+        print(f"  Protein input_ids sample: {protein_input_ids[0][:10].tolist()}")
+        
+        # Check for all-zero sequences
+        if torch.any(desc_mask_sums == 0):
+            zero_desc_indices = torch.where(desc_mask_sums == 0)[0]
+            print(f"  Found {len(zero_desc_indices)} empty descriptions at indices: {zero_desc_indices.tolist()}")
+        
+        if torch.any(prot_mask_sums == 0):
+            zero_prot_indices = torch.where(prot_mask_sums == 0)[0]
+            print(f"  Found {len(zero_prot_indices)} empty proteins at indices: {zero_prot_indices.tolist()}")
+
     base_model = model
     if isinstance(model, DistributedDataParallel):
         base_model = model.module
@@ -348,6 +380,14 @@ def teacher_forcing_forward_pass(
         # Debug print only if NaN detected before normalization
         if torch.isnan(description_output).any():
             print(f"DEBUG NaN in description_output before normalization")
+        
+        # Check for zero vectors before normalization
+        norms = torch.norm(description_output, p=2, dim=-1)
+        zero_mask = (norms == 0)
+        if zero_mask.any():
+            print(f"DEBUG: Found {zero_mask.sum().item()} zero vectors in description_output")
+            # Replace zero vectors with small random values to avoid NaN
+            description_output[zero_mask] = torch.randn_like(description_output[zero_mask]) * 1e-6
         
         description_output = torch.nn.functional.normalize(description_output, p=2, dim=-1)
         
@@ -432,6 +472,28 @@ def train_epoch(
 
     t = tqdm(iter(dataloader))
     for batch_idx, data_batch in enumerate(t):
+        # Debug first batch to check data quality
+        if batch_idx == 0 and rank == 0:
+            print(f"DEBUG: First batch data inspection:")
+            print(f"  Available keys: {list(data_batch.keys())}")
+            
+            if "protein_input_ids" in data_batch:
+                print(f"  Protein input_ids shape: {data_batch['protein_input_ids'].shape}")
+                print(f"  Protein attention_mask shape: {data_batch['protein_attention_mask'].shape}")
+                print(f"  Description input_ids shape: {data_batch['description_input_ids'].shape}")
+                print(f"  Description attention_mask shape: {data_batch['description_attention_mask'].shape}")
+                
+                # Check for any completely empty sequences
+                prot_lens = data_batch['protein_attention_mask'].sum(dim=1)
+                desc_lens = data_batch['description_attention_mask'].sum(dim=1)
+                print(f"  Protein sequence lengths: min={prot_lens.min()}, max={prot_lens.max()}, mean={prot_lens.float().mean():.1f}")
+                print(f"  Description sequence lengths: min={desc_lens.min()}, max={desc_lens.max()}, mean={desc_lens.float().mean():.1f}")
+                
+                if "protein_sequence" in data_batch:
+                    print(f"  Sample protein sequence: {data_batch['protein_sequence'][0][:50]}...")
+                if "description" in data_batch:
+                    print(f"  Sample description: {data_batch['description'][0][:100]}...")
+        
         # with autocast, logits will be in AUTOCAST_DTYPE 
         # but loss will be re-casted to torch.float32
         # and model weights will stay in torch.float32
@@ -563,6 +625,17 @@ def train_on_device(
     train_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv")
     )
+    
+    # Debug: Check the raw data quality
+    if rank == 0:
+        print(f"DEBUG: Dataset size: {len(train_dataset.data)}")
+        sample_data = train_dataset.data[:3]  # Check first 3 samples
+        for i, sample in enumerate(sample_data):
+            print(f"  Sample {i}:")
+            print(f"    Sequence length: {len(sample.get('sequence', ''))}")
+            print(f"    Function length: {len(sample.get('function', ''))}")
+            print(f"    Function: {sample.get('function', 'MISSING')[:100]}...")
+            
     if args["debug_trim_train_split"]:
         # Trim the dataset for debugging
         original_data = train_dataset.data
@@ -581,6 +654,25 @@ def train_on_device(
         mode="train",
         include_text_fields=True,
     )
+    
+    # Debug: Test the collater on a small sample
+    if rank == 0:
+        print("DEBUG: Testing collater with sample data...")
+        sample_batch = [train_dataset.data.iloc[i].to_dict() for i in range(min(2, len(train_dataset.data)))]
+        print(f"  Raw sample data keys: {list(sample_batch[0].keys())}")
+        print(f"  Sample function: '{sample_batch[0].get('function', 'MISSING')}'")
+        
+        try:
+            test_batch = train_collater(sample_batch)
+            print(f"  Collated batch keys: {list(test_batch.keys())}")
+            if 'description_attention_mask' in test_batch:
+                desc_lens = test_batch['description_attention_mask'].sum(dim=1)
+                print(f"  Description lengths after tokenization: {desc_lens.tolist()}")
+            if 'description_input_ids' in test_batch:
+                print(f"  Description input_ids shape: {test_batch['description_input_ids'].shape}")
+                print(f"  Sample description tokens: {test_batch['description_input_ids'][0][:10].tolist()}")
+        except Exception as e:
+            print(f"  ERROR in collater: {e}")
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
