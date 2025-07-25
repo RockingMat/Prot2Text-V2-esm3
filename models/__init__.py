@@ -4,3 +4,5 @@ from .configuration_esm2rgcn2llama_instruct import RgcnAdapterConfig, Esm2Rgcn2L
 from .modeling_esm2llama_instruct import ModalityAdapter, Esm2LlamaInstructForCausalLM
 from .modeling_esm2llama_legacy import EsmEncoderModel, Esm2LlamaForCausalLM
 from .modeling_esm2rgcn2llama_instruct import RgcnAdapter, Esm2Rgcn2LlamaInstructForCausalLM
+from .esmc_config import ESMCConfig
+from .esmc_qwen_arc import ESMCQwen

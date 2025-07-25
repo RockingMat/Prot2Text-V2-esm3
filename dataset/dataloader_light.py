@@ -1,6 +1,6 @@
 """
 Light-weight dataset and data collater class for protein function prediction 
-instruction tuning. To be used with Esm2LlamaInstructForCausalLM. 
+instruction tuning. Compatible with both Esm2LlamaInstructForCausalLM and ESMCQwen models.
 
 Such flexible implementation is designed to fetch raw text data from a CSV file 
 and perform tokenization and padding on-the-fly. This is useful when the default 
@@ -8,13 +8,19 @@ user message and chat template is not suitable for the task at hand.
 
 Can only be used if the model is not requiring graph-related data.
 
+The collater supports two modes for protein sequences:
+1. Tokenized sequences (use_raw_sequences=False) - for Esm2LlamaInstructForCausalLM
+2. Raw sequences (use_raw_sequences=True) - for ESMCQwen and similar models
+
 Every batch from DataLoader will contain following attributes:
     * Training mode (train-eval with teacher-forcing): 
         - graph related features:
             None
-        - amino-acid sequence: 
+        - amino-acid sequence (when use_raw_sequences=False): 
             - protein_input_ids (bsz, max_seq_len+2)  # bos and eos tokens
             - protein_attention_mask (bsz, max_seq_len+2)  # right padding
+        - amino-acid sequence (when use_raw_sequences=True):
+            - protein_sequences (List[str])  # raw protein sequences
         - concatenated chat:
             - input_ids (bsz, max_prompt_len+max_text_len+1)
             - attention_mask (bsz, max_prompt_len+max_text_len+1)
@@ -32,9 +38,11 @@ Every batch from DataLoader will contain following attributes:
     * Inference mode (iterative generation):
         - graph related features: 
             None
-        - amino-acid sequence: 
+        - amino-acid sequence (when use_raw_sequences=False): 
             - protein_input_ids (bsz, max_seq_len+2)  # bos and eos tokens
             - protein_attention_mask (bsz, max_seq_len+2)  # right padding
+        - amino-acid sequence (when use_raw_sequences=True):
+            - protein_sequences (List[str])  # raw protein sequences
         - prompt chat: 
             - input_ids (bsz, max_prompt_len)
             - attention_mask (bsz, max_prompt_len)
@@ -44,7 +52,7 @@ Every batch from DataLoader will contain following attributes:
         mask     = [0s       + 1   + 1s     & ]
         desc_ids =                        [ & description + eot + right-pad]
 
-Example of usage: 
+Example of usage for Esm2LlamaInstructForCausalLM: 
 >>> from torch.utils.data import DataLoader
 >>> from transformers import AutoTokenizer
 >>> from dataset import Prot2TextLightDataset, Prot2TextLightCollater
@@ -57,7 +65,8 @@ Example of usage:
 >>> train_collater = Prot2TextLightCollater(
         sequence_tokenizer=esm_tokenizer,
         description_tokenizer=llama_tokenizer,
-        mode="train"
+        mode="train",
+        use_raw_sequences=False  # Use tokenized sequences
     )
 >>> train_dataloader = DataLoader(
         train_dataset,
@@ -68,10 +77,18 @@ Example of usage:
         pin_memory=True, 
         drop_last=True
     )
+
+Example of usage for ESMCQwen:
+>>> train_collater = Prot2TextLightCollater(
+        sequence_tokenizer=None,  # Not needed for raw sequences
+        description_tokenizer=qwen_tokenizer,
+        mode="train",
+        use_raw_sequences=True  # Use raw sequences
+    )
 """
 
 import random
-from typing import Dict, List, Literal, Optional
+from typing import Dict, List, Literal, Optional, Union
 
 import pandas as pd
 import torch
@@ -98,7 +115,7 @@ class Prot2TextLightDataset(torch.utils.data.Dataset):
 class Prot2TextLightCollater: 
     def __init__(
             self, 
-            sequence_tokenizer: PreTrainedTokenizer,
+            sequence_tokenizer: Optional[PreTrainedTokenizer],
             description_tokenizer: PreTrainedTokenizer,
             mode: Literal["train", "inference"] = "train", 
             include_text_fields: bool = True,
@@ -113,6 +130,7 @@ class Prot2TextLightCollater:
                 "professional language. "
             ), 
             placeholder_token: str = '<|reserved_special_token_1|>', 
+            use_raw_sequences: bool = False,
     ):
         self.sequence_tokenizer = sequence_tokenizer
         self.description_tokenizer = description_tokenizer
@@ -126,8 +144,16 @@ class Prot2TextLightCollater:
         self.max_description_length = max_description_length
         self.system_message = system_message
         self.placeholder_token = placeholder_token
+        self.use_raw_sequences = use_raw_sequences
 
-    def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, torch.Tensor]:
+        # Validation
+        if not use_raw_sequences and sequence_tokenizer is None:
+            raise ValueError("sequence_tokenizer must be provided when use_raw_sequences=False")
+        if use_raw_sequences and sequence_tokenizer is not None:
+            import warnings
+            warnings.warn("sequence_tokenizer provided but will be ignored when use_raw_sequences=True")
+
+    def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, Union[List[str], torch.Tensor]]:
         # group data across batch
         accessions = [item["AlphaFoldDB"] for item in batch]
         fullnames = [item["Full Name"] for item in batch]
@@ -149,28 +175,34 @@ class Prot2TextLightCollater:
             for taxon in taxons
         ]
 
-        # for each sequence in sequences
-        # if the sequence is origianlly longer than max_sequence_length, take a segment of that length randomly 
-        # else do nothing
-        for i in range(len(sequences)):
-            if len(sequences[i]) > self.max_sequence_length:
-                start = random.randint(0, len(sequences[i]) - self.max_sequence_length)
-                sequences[i] = sequences[i][start:start + self.max_sequence_length]
+        # process sequences - crop if too long
+        processed_sequences = []
+        for sequence in sequences:
+            if len(sequence) > self.max_sequence_length:
+                start = random.randint(0, len(sequence) - self.max_sequence_length)
+                processed_sequences.append(sequence[start:start + self.max_sequence_length])
+            else:
+                processed_sequences.append(sequence)
 
-        # truncate and tokenize sequences
-        self.sequence_tokenizer.padding_side = "right"
-        tokenized_sequences = self.sequence_tokenizer(
-            sequences, 
-            truncation=True, 
-            padding="longest", 
-            max_length=self.max_sequence_length + 2,  # including bos and eos tokens of esm tokenizer
-            return_tensors="pt"
-        )
-        sequence_input_ids = tokenized_sequences["input_ids"]
-        sequence_attention_mask = tokenized_sequences["attention_mask"]
-
-        # apply chat template
-        sequence_lens = sequence_attention_mask.sum(dim=1).tolist()
+        # Handle protein sequences based on mode
+        if self.use_raw_sequences:
+            # Keep sequences as raw strings for models like ESMCQwen
+            sequence_input_ids = None
+            sequence_attention_mask = None
+            sequence_lens = [len(seq) for seq in processed_sequences]
+        else:
+            # Tokenize sequences for models like Esm2LlamaInstruct
+            self.sequence_tokenizer.padding_side = "right"
+            tokenized_sequences = self.sequence_tokenizer(
+                processed_sequences, 
+                truncation=True, 
+                padding="longest", 
+                max_length=self.max_sequence_length + 2,  # including bos and eos tokens
+                return_tensors="pt"
+            )
+            sequence_input_ids = tokenized_sequences["input_ids"]
+            sequence_attention_mask = tokenized_sequences["attention_mask"]
+            sequence_lens = sequence_attention_mask.sum(dim=1).tolist()
 
         if self.include_text_fields: 
             user_messages = [
@@ -187,8 +219,8 @@ class Prot2TextLightCollater:
             ]
         else: 
             user_messages = [
-                "Sequence embeddings: " + self.placeholder_token * sequence_lens
-                for sequence_lens in sequence_lens
+                "Sequence embeddings: " + self.placeholder_token * sequence_len
+                for sequence_len in sequence_lens
             ]
 
         prompt_conversations = [
@@ -234,12 +266,23 @@ class Prot2TextLightCollater:
         labels = description_input_ids.clone()
         labels[description_attention_mask == 0] = -100
 
-        # assemble
+        # assemble return dictionary
+        result = {
+            "name": accessions,
+            "description_input_ids": description_input_ids,
+            "description_attention_mask": description_attention_mask
+        }
+        
+        # Add protein data based on mode
+        if self.use_raw_sequences:
+            result["protein_sequences"] = processed_sequences
+        else:
+            result["protein_input_ids"] = sequence_input_ids
+            result["protein_attention_mask"] = sequence_attention_mask
+        
+        # Add text data based on train/inference mode
         if self.mode == "train": 
-            return {
-                "name": accessions,
-                "protein_input_ids": sequence_input_ids, 
-                "protein_attention_mask": sequence_attention_mask, 
+            result.update({
                 "input_ids": torch.cat([
                     prompt_input_ids, 
                     description_input_ids, 
@@ -255,19 +298,13 @@ class Prot2TextLightCollater:
                     ), 
                     labels,
                 ], dim=1), 
-                "description_input_ids": description_input_ids,
-                "description_attention_mask": description_attention_mask
-            }
-
+            })
         elif self.mode == "inference":
-            return {
-                "name": accessions,
-                "protein_input_ids": sequence_input_ids, 
-                "protein_attention_mask": sequence_attention_mask, 
+            result.update({
                 "input_ids": prompt_input_ids, 
                 "attention_mask": prompt_attention_mask, 
-                "description_input_ids": description_input_ids, 
-            }
-
+            })
         else: 
             raise ValueError(f"Invalid mode: {self.mode}")
+            
+        return result
