@@ -531,10 +531,64 @@ def train_epoch(
                 print(f"  Protein sequence lengths: min={prot_lens.min()}, max={prot_lens.max()}, mean={prot_lens.float().mean():.1f}")
                 print(f"  Description sequence lengths: min={desc_lens.min()}, max={desc_lens.max()}, mean={desc_lens.float().mean():.1f}")
                 
+                # Additional dataloader quality checks
+                if torch.any(prot_lens == 0):
+                    print(f"  WARNING: Found {torch.sum(prot_lens == 0)} empty protein sequences in batch")
+                if torch.any(desc_lens == 0):
+                    print(f"  WARNING: Found {torch.sum(desc_lens == 0)} empty description sequences in batch")
+                if torch.any(prot_lens == 1):
+                    print(f"  WARNING: Found {torch.sum(prot_lens == 1)} single-token protein sequences in batch")
+                if torch.any(desc_lens == 1):
+                    print(f"  WARNING: Found {torch.sum(desc_lens == 1)} single-token description sequences in batch")
+                
                 if "protein_sequence" in data_batch:
                     print(f"  Sample protein sequence: {data_batch['protein_sequence'][0][:50]}...")
                 if "description" in data_batch:
                     print(f"  Sample description: {data_batch['description'][0][:100]}...")
+        
+        # Check for dataloader issues on every 100th batch
+        if batch_idx % 100 == 0 and rank == 0:
+            if "protein_attention_mask" in data_batch and "description_attention_mask" in data_batch:
+                prot_lens = data_batch['protein_attention_mask'].sum(dim=1)
+                desc_lens = data_batch['description_attention_mask'].sum(dim=1)
+                
+                # Check for problematic sequences
+                if torch.any(prot_lens == 0) or torch.any(desc_lens == 0):
+                    print(f"  DATALOADER WARNING at batch {batch_idx}: Found empty sequences")
+                if torch.any(prot_lens == 1) or torch.any(desc_lens == 1):
+                    print(f"  DATALOADER WARNING at batch {batch_idx}: Found single-token sequences")
+                    
+                # Check for extreme sequence lengths that might cause memory issues
+                if torch.any(prot_lens > 2000) or torch.any(desc_lens > 500):
+                    print(f"  DATALOADER WARNING at batch {batch_idx}: Found very long sequences (prot_max={prot_lens.max()}, desc_max={desc_lens.max()})")
+                
+                # Check batch size consistency
+                actual_batch_size = data_batch['protein_input_ids'].shape[0]
+                if actual_batch_size != args["batch_size_per_device"]:
+                    print(f"  DATALOADER WARNING at batch {batch_idx}: Inconsistent batch size {actual_batch_size}, expected {args['batch_size_per_device']}")
+        
+        # Check for tensor integrity issues
+        for key in ['protein_input_ids', 'protein_attention_mask', 'description_input_ids', 'description_attention_mask']:
+            if key in data_batch:
+                tensor = data_batch[key]
+                if torch.any(torch.isnan(tensor)) or torch.any(torch.isinf(tensor)):
+                    print(f"  DATALOADER ERROR at batch {batch_idx}: NaN/Inf detected in {key}")
+                if key.endswith('_input_ids') and torch.any(tensor < 0):
+                    print(f"  DATALOADER ERROR at batch {batch_idx}: Negative token IDs in {key}")
+                    
+                # Check for empty tensors
+                if tensor.numel() == 0:
+                    print(f"  DATALOADER ERROR at batch {batch_idx}: Empty tensor for {key}")
+                
+                # Check tensor shapes are reasonable
+                if len(tensor.shape) != 2:
+                    print(f"  DATALOADER ERROR at batch {batch_idx}: Unexpected tensor shape for {key}: {tensor.shape}")
+                    
+        # Monitor memory usage periodically
+        if batch_idx % 500 == 0 and rank == 0 and torch.cuda.is_available():
+            memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+            memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+            print(f"  MEMORY at batch {batch_idx}: allocated={memory_allocated:.2f}GB, reserved={memory_reserved:.2f}GB")
         
         # with autocast, logits will be in AUTOCAST_DTYPE 
         # but loss will be re-casted to torch.float32
@@ -664,6 +718,36 @@ def train_on_device(
         pad_token='<|reserved_special_token_0|>'
     )
 
+    # Debug: Test tokenizers
+    if rank == 0:
+        print("DEBUG: Testing tokenizers...")
+        
+        # Test ESM tokenizer
+        test_protein = "MKTVRQERLKSIVRILERSKEPVSGAQLAEELSVSRQVIVQDIAYLRSLGYNIVATPRGYVL"
+        try:
+            esm_tokens = esm_tokenizer(test_protein, return_tensors="pt", padding=True)
+            print(f"  ESM tokenizer working: input_len={len(test_protein)}, tokens_len={esm_tokens['input_ids'].shape[1]}")
+            if esm_tokens['input_ids'].shape[1] == 0:
+                print(f"    WARNING: ESM tokenizer produced empty output")
+            if torch.any(esm_tokens['input_ids'] < 0):
+                print(f"    WARNING: ESM tokenizer produced negative token IDs")
+        except Exception as e:
+            print(f"  ERROR: ESM tokenizer failed: {e}")
+        
+        # Test LLAMA tokenizer
+        test_description = "This protein catalyzes the phosphorylation of riboflavin."
+        try:
+            llama_tokens = llama_tokenizer(test_description, return_tensors="pt", padding=True)
+            print(f"  LLAMA tokenizer working: input_len={len(test_description)}, tokens_len={llama_tokens['input_ids'].shape[1]}")
+            if llama_tokens['input_ids'].shape[1] == 0:
+                print(f"    WARNING: LLAMA tokenizer produced empty output")
+            if torch.any(llama_tokens['input_ids'] < 0):
+                print(f"    WARNING: LLAMA tokenizer produced negative token IDs")
+            print(f"  LLAMA pad_token_id: {llama_tokenizer.pad_token_id}")
+            print(f"  LLAMA eos_token_id: {llama_tokenizer.eos_token_id}")
+        except Exception as e:
+            print(f"  ERROR: LLAMA tokenizer failed: {e}")
+
     train_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv")
     )
@@ -672,11 +756,51 @@ def train_on_device(
     if rank == 0:
         print(f"DEBUG: Dataset size: {len(train_dataset.data)}")
         sample_data = [train_dataset[i] for i in range(min(3, len(train_dataset)))]  # Check first 3 samples
+        
+        # Count problematic samples
+        empty_sequences = 0
+        empty_functions = 0
+        short_sequences = 0
+        short_functions = 0
+        
         for i, sample in enumerate(sample_data):
+            seq = sample.get('sequence', '')
+            func = sample.get('function', '')
             print(f"  Sample {i}:")
-            print(f"    Sequence length: {len(sample.get('sequence', ''))}")
-            print(f"    Function length: {len(sample.get('function', ''))}")
-            print(f"    Function: {sample.get('function', 'MISSING')[:100]}...")
+            print(f"    Sequence length: {len(seq)}")
+            print(f"    Function length: {len(func)}")
+            print(f"    Function: {func[:100]}...")
+            
+            if not seq or len(seq) == 0:
+                empty_sequences += 1
+            if not func or len(func) == 0:
+                empty_functions += 1
+            if len(seq) < 20:
+                short_sequences += 1
+            if len(func) < 10:
+                short_functions += 1
+        
+        # Report data quality issues
+        if empty_sequences > 0:
+            print(f"  WARNING: Found {empty_sequences} samples with empty protein sequences")
+        if empty_functions > 0:
+            print(f"  WARNING: Found {empty_functions} samples with empty function descriptions")
+        if short_sequences > 0:
+            print(f"  WARNING: Found {short_sequences} samples with very short protein sequences (<20 chars)")
+        if short_functions > 0:
+            print(f"  WARNING: Found {short_functions} samples with very short function descriptions (<10 chars)")
+            
+        # Check for required fields
+        required_fields = ['sequence', 'function']
+        missing_fields = []
+        for field in required_fields:
+            if field not in sample_data[0]:
+                missing_fields.append(field)
+        
+        if missing_fields:
+            print(f"  ERROR: Missing required fields in dataset: {missing_fields}")
+        else:
+            print(f"  Dataset validation passed: all required fields present")
             
     if args["debug_trim_train_split"]:
         # Trim the dataset for debugging
@@ -704,17 +828,68 @@ def train_on_device(
         print(f"  Raw sample data keys: {list(sample_batch[0].keys())}")
         print(f"  Sample function: '{sample_batch[0].get('function', 'MISSING')}'")
         
+        # Check raw data quality before collation
+        for i, sample in enumerate(sample_batch):
+            seq = sample.get('sequence', '')
+            func = sample.get('function', '')
+            if not seq or len(seq) == 0:
+                print(f"  WARNING: Sample {i} has empty protein sequence")
+            if not func or len(func) == 0:
+                print(f"  WARNING: Sample {i} has empty function description")
+            if len(seq) < 10:
+                print(f"  WARNING: Sample {i} has very short protein sequence ({len(seq)} chars)")
+            if len(func) < 10:
+                print(f"  WARNING: Sample {i} has very short function description ({len(func)} chars)")
+        
         try:
             test_batch = train_collater(sample_batch)
             print(f"  Collated batch keys: {list(test_batch.keys())}")
+            
+            # Check collated data quality
+            required_keys = ['protein_input_ids', 'protein_attention_mask', 'description_input_ids', 'description_attention_mask']
+            for key in required_keys:
+                if key not in test_batch:
+                    print(f"  ERROR: Missing required key '{key}' in collated batch")
+            
             if 'description_attention_mask' in test_batch:
                 desc_lens = test_batch['description_attention_mask'].sum(dim=1)
                 print(f"  Description lengths after tokenization: {desc_lens.tolist()}")
+                if torch.any(desc_lens == 0):
+                    print(f"  WARNING: Found empty description sequences after tokenization")
+                if torch.any(desc_lens == 1):
+                    print(f"  WARNING: Found single-token description sequences after tokenization")
+                    
+            if 'protein_attention_mask' in test_batch:
+                prot_lens = test_batch['protein_attention_mask'].sum(dim=1)
+                print(f"  Protein lengths after tokenization: {prot_lens.tolist()}")
+                if torch.any(prot_lens == 0):
+                    print(f"  WARNING: Found empty protein sequences after tokenization")
+                if torch.any(prot_lens == 1):
+                    print(f"  WARNING: Found single-token protein sequences after tokenization")
+                    
             if 'description_input_ids' in test_batch:
                 print(f"  Description input_ids shape: {test_batch['description_input_ids'].shape}")
                 print(f"  Sample description tokens: {test_batch['description_input_ids'][0][:10].tolist()}")
+                
+                # Check for unusual token patterns
+                desc_ids = test_batch['description_input_ids']
+                if torch.any(desc_ids < 0):
+                    print(f"  WARNING: Found negative token IDs in description")
+                if torch.all(desc_ids == 0):
+                    print(f"  WARNING: All description tokens are zero (padding)")
+                    
+            if 'protein_input_ids' in test_batch:
+                print(f"  Protein input_ids shape: {test_batch['protein_input_ids'].shape}")
+                prot_ids = test_batch['protein_input_ids']
+                if torch.any(prot_ids < 0):
+                    print(f"  WARNING: Found negative token IDs in protein sequences")
+                if torch.all(prot_ids == 0):
+                    print(f"  WARNING: All protein tokens are zero (padding)")
+                    
         except Exception as e:
             print(f"  ERROR in collater: {e}")
+            import traceback
+            traceback.print_exc()
     
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -727,6 +902,57 @@ def train_on_device(
         collate_fn=train_collater,
     )
     print(f"Train dataset loaded on rank:{rank}")
+
+    # Debug: Test dataloader by checking first few batches
+    if rank == 0:
+        print("DEBUG: Testing dataloader with first few batches...")
+        try:
+            dataloader_iter = iter(train_loader)
+            for batch_idx in range(min(3, len(train_loader))):
+                try:
+                    batch = next(dataloader_iter)
+                    print(f"  Batch {batch_idx} loaded successfully")
+                    
+                    # Check batch structure
+                    required_keys = ['protein_input_ids', 'protein_attention_mask', 'description_input_ids', 'description_attention_mask']
+                    for key in required_keys:
+                        if key not in batch:
+                            print(f"    ERROR: Missing key '{key}' in batch {batch_idx}")
+                        else:
+                            tensor = batch[key]
+                            print(f"    {key}: shape={tensor.shape}, dtype={tensor.dtype}")
+                            
+                            # Check for problematic values
+                            if torch.any(torch.isnan(tensor)):
+                                print(f"    WARNING: NaN values found in {key}")
+                            if torch.any(torch.isinf(tensor)):
+                                print(f"    WARNING: Inf values found in {key}")
+                            if key.endswith('_input_ids') and torch.any(tensor < 0):
+                                print(f"    WARNING: Negative token IDs found in {key}")
+                            if key.endswith('_attention_mask'):
+                                mask_sums = tensor.sum(dim=1)
+                                if torch.any(mask_sums == 0):
+                                    print(f"    WARNING: Empty sequences (zero attention mask) in {key}")
+                                if torch.any(mask_sums == 1):
+                                    print(f"    WARNING: Single-token sequences in {key}")
+                                print(f"    {key} lengths: min={mask_sums.min()}, max={mask_sums.max()}, mean={mask_sums.float().mean():.1f}")
+                    
+                    # Check batch size consistency
+                    batch_size = batch['protein_input_ids'].shape[0]
+                    if batch_size != args["batch_size_per_device"]:
+                        print(f"    WARNING: Batch {batch_idx} has size {batch_size}, expected {args['batch_size_per_device']}")
+                        
+                except Exception as e:
+                    print(f"    ERROR loading batch {batch_idx}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    break
+                    
+            print("  Dataloader test completed")
+        except Exception as e:
+            print(f"  ERROR testing dataloader: {e}")
+            import traceback
+            traceback.print_exc()
 
     eval_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['eval_split']}.csv")
