@@ -313,18 +313,6 @@ def teacher_forcing_forward_pass(
             "for contrastive learning."
         )
     
-    # Validation check for reasonable segment size
-    if segment_size < 2:
-        raise ValueError(
-            f"Segment size ({segment_size}) is too small for contrastive learning. "
-            f"batch_size ({batch_size}) / contrastive_num_segments ({contrastive_num_segments}) "
-            f"must be at least 2. Consider reducing contrastive_num_segments or increasing batch_size."
-        )
-    
-    # Debug print to understand the segmentation
-    if rank == 0:  # Only print from rank 0 to avoid spam
-        print(f"DEBUG: batch_size={batch_size}, num_segments={contrastive_num_segments}, segment_size={segment_size}")
-    
     acc_loss = torch.zeros([]).to(rank)
     loss_fn = SegmentedBatchInfoNCELoss()
 
@@ -355,25 +343,13 @@ def teacher_forcing_forward_pass(
             device=rank
         )
 
-        segment_loss = loss_fn(
+        acc_loss += loss_fn(
             segment_output1=segment_protein_output, 
             batch_output2=description_output, 
             labels=labels
         )
-        
-        # Debug print for loss values
-        if rank == 0 and segment_id == 0:  # Only print from first segment of rank 0
-            print(f"DEBUG: segment_loss={segment_loss.item():.6f}")
 
-        acc_loss += segment_loss
-
-    final_loss = acc_loss / contrastive_num_segments
-    
-    # Debug print for final loss
-    if rank == 0:
-        print(f"DEBUG: acc_loss={acc_loss.item():.6f}, final_loss={final_loss.item():.6f}")
-    
-    return final_loss
+    return acc_loss / contrastive_num_segments
 
 
 def setup(rank: int, world_size: int):
@@ -426,11 +402,10 @@ def train_epoch(
         loss = loss / args["gradient_accumulation_steps"]
 
         # summary current batch
-        batch_loss_value = loss.item() * args["gradient_accumulation_steps"]
         t.set_postfix({
             "mode": "train",
             "epoch": f"{current_epoch}/{args['num_epochs']}",
-            "batch_loss": f"{batch_loss_value:.6f}",
+            "batch_loss": loss.item() * args["gradient_accumulation_steps"],
             "device": f"rank:{rank}"
         })
         ddp_loss[0] += loss.item() * args["gradient_accumulation_steps"]
