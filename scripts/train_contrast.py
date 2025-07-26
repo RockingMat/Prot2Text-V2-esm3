@@ -47,11 +47,8 @@ import scripts.utils_argparse as utils_argparse
 
 argParser = argparse.ArgumentParser()
 
-# Required arguments
 argParser.add_argument("--root_csv_dir", type=str, default="./data", help="Directory containing train/eval CSV files")
 argParser.add_argument("--save_checkpoint_dir", type=str, default="./checkpoints", help="Directory to save checkpoints")
-
-# Optional checkpoint loading
 argParser.add_argument("--load_model_checkpoint_path", type=str, default="", help="Path to model checkpoint to load")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="", help="Path to optimizer/scheduler checkpoint to load")
 
