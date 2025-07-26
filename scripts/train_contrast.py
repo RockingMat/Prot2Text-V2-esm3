@@ -32,7 +32,7 @@ from torch.optim import Adam, AdamW, Optimizer
 from torch.optim.lr_scheduler import StepLR
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, PreTrainedModel, AutoModelForCausalLM, EsmConfig
+from transformers import AutoTokenizer, PreTrainedModel, get_cosine_schedule_with_warmup, AutoModelForCausalLM, EsmConfig
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
@@ -55,23 +55,21 @@ argParser.add_argument("--save_checkpoint_dir", type=str, required=True, help="D
 argParser.add_argument("--load_model_checkpoint_path", type=str, default="", help="Path to model checkpoint to load")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="", help="Path to optimizer/scheduler checkpoint to load")
 
-# Training hyperparameters with sensible defaults
-argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="float16", help="Training dtype (default: float16)")
-argParser.add_argument("--batch_size_per_device", type=int, default=8, help="Batch size per device (default: 8)")
-argParser.add_argument("--num_epochs", type=int, default=5, help="Number of training epochs (default: 5)")
-argParser.add_argument("--save_every_epochs", type=int, default=1, help="Save checkpoint every N epochs (default: 1)")
-argParser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps (default: 1)")
-argParser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate (default: 1e-4)")
-argParser.add_argument("--gradient_clipping", type=float, default=None, help="Gradient clipping threshold (default: None)")
-argParser.add_argument("--scheduler_gamma", type=float, default=0.99, help="Scheduler gamma (default: 0.99)")
-argParser.add_argument("--random_seed", type=int, default=42, help="Random seed (default: 42)")
-argParser.add_argument("--contrastive_num_segments", type=int, default=2, help="Number of contrastive segments (default: 2)")
+argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="bfloat16")
+argParser.add_argument("--batch_size_per_device", type=int, default=8)
+argParser.add_argument("--num_epochs", type=int, default=12)
+argParser.add_argument("--save_every_epochs", type=int, default=1)
+argParser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+argParser.add_argument("--learning_rate", type=float, default=2e-4)
+argParser.add_argument("--gradient_clipping", type=float, default=None)
+argParser.add_argument("--scheduler_gamma", type=float, default=0.1)
+argParser.add_argument("--random_seed", type=int, default=42)
+argParser.add_argument("--contrastive_num_segments", type=int, default=2)
 
-# Dataset splits with defaults
-argParser.add_argument("--train_split", type=str, default="train", help="Training split name (default: train)")
-argParser.add_argument("--eval_split", type=str, default="validation", help="Evaluation split name (default: validation)")
-argParser.add_argument("--debug_trim_train_split", type=int, default=None, help="Trim training dataset for debugging")
-argParser.add_argument("--debug_trim_eval_split", type=int, default=None, help="Trim evaluation dataset for debugging")
+argParser.add_argument("--train_split", type=str, default="train")
+argParser.add_argument("--eval_split", type=str, default="validation")
+argParser.add_argument("--debug_trim_train_split", type=int, default=None)
+argParser.add_argument("--debug_trim_eval_split", type=int, default=None)
 
 
 class BatchInfoNCELoss(torch.nn.Module):
@@ -595,8 +593,23 @@ def train_on_device(
     print(f"DDP model loaded on rank:{rank}")
 
     # initialization of the optimizer after wrapping the model
-    optimizer = Adam(model.parameters(), lr=args["learning_rate"])
-    scheduler = StepLR(optimizer, step_size=1, gamma=args["scheduler_gamma"])
+    optimizer = AdamW(
+        model.parameters(),
+        lr=args["learning_rate"],
+        eps=1e-6,
+        betas=(0.9, 0.999),
+    )
+    # compute total training steps:
+    total_steps = (
+        args["num_epochs"]
+        * (len(train_loader) // args["gradient_accumulation_steps"])
+    )
+    warmup_steps = int(0.06 * total_steps)
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps,
+    )
     if args["load_optimizer_scheduler_checkpoint_path"]:
         print(f"Loading {args['load_optimizer_scheduler_checkpoint_path']}")
         checkpoint_state_dicts = torch.load(
