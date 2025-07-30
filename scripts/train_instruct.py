@@ -1,5 +1,5 @@
 """
-Stage 2 - instruction tuning training script for ESM-LLAMA protein description 
+Stage 2 - instruction tuning training script for ESM-LLM protein description 
 generation on ESMCQwen model. 
 
 With LoRA. 
@@ -63,6 +63,7 @@ argParser.add_argument("--gradient_accumulation_steps", type=int, default=8)
 argParser.add_argument("--learning_rate", type=float, default=0.0002)
 argParser.add_argument("--gradient_clipping", type=float, default=None)
 argParser.add_argument("--scheduler_gamma", type=float, default=0.95)
+argParser.add_argument("--gradient_checkpointing", type=utils_argparse.str2bool, default=False)
 argParser.add_argument("--random_seed", type=int, default=42)
 argParser.add_argument("--fix_modality_adapter", type=utils_argparse.str2bool, default=False)
 argParser.add_argument("--lora_rank", type=int, default=32)
@@ -84,6 +85,15 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     if provided.
     """
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
+
+    # Setup tokenizer
+    tokenizer = AutoTokenizer.from_pretrained(
+        ESMCConfig.llm_model_name, 
+        trust_remote_code=True
+    )
+    
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     llm_decoder = AutoModelForCausalLM.from_pretrained(
         ESMCConfig.llm_model_name,
@@ -110,6 +120,9 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         adapter=adapter,
         llm_decoder=llm_decoder,
     )
+    
+    # Store tokenizer as model attribute for easy access
+    model.tokenizer = tokenizer
 
     # overwrite weights of base model if checkpoint path is provided
     if args["load_model_checkpoint_path"]:
@@ -138,14 +151,20 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
             bias="none", 
             init_lora_weights=True, 
             target_modules=[
+                # LLM decoder modules
                 "self_attn.q_proj", 
                 "self_attn.k_proj", 
                 "self_attn.v_proj", 
                 "self_attn.o_proj", 
                 "mlp.gate_proj", 
                 "mlp.up_proj", 
-                "mlp.down_proj"
-            ],  # for llm_decoder 
+                "mlp.down_proj",
+                # ESM encoder modules
+                "layernorm_qkv.1",
+                "out_proj",
+                "ffn.1",
+                "ffn.3",
+            ],
             modules_to_save=(
                 ["adapter.fc1", "adapter.fc2"] 
                 if not args["fix_modality_adapter"] 
@@ -158,8 +177,8 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     
     # Simple LoRA verification - check if adapters were added to expected components
     esm_lora_count = sum(1 for name, _ in model.named_modules() if 'esm_encoder' in name and 'lora' in name)
-    llama_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
-    print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLaMA decoder has {llama_lora_count} LoRA modules")
+    llm_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
+    print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLM decoder has {llm_lora_count} LoRA modules")
 
     return model
 
@@ -230,7 +249,7 @@ def train_epoch(
         loss = teacher_forcing_forward_pass(
             rank=rank, 
             model=model, 
-            data_batch=data_batch, 
+            data_batch=data_batch,
         )
 
         # rescale loss for consistency with different gradient accumulation steps
@@ -333,12 +352,16 @@ def train_on_device(
     """
     setup(rank, world_size)
 
-    # prepare datasets and dataloaders
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        ESMCConfig.llm_model_name, 
-        pad_token='<|reserved_special_token_0|>',
-        trust_remote_code=True
-    )
+    # Load model which handles all tokenizer setup internally
+    torch.cuda.set_device(rank)
+    model = load_model(args=args)
+    
+    # Get tokenizer from the model
+    tokenizer = model.tokenizer
+    
+    model = model.to(rank)
+
+    # Prepare datasets and dataloaders using the model's tokenizer
 
     train_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv"),
@@ -353,14 +376,13 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # ESMCQwen uses raw sequences
-        description_tokenizer=llama_tokenizer,
+        description_tokenizer=tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],
         name_dropout=args["name_dropout"],
         taxonomy_dropout=args["taxonomy_dropout"],
-        use_raw_sequences=True,  # Enable raw sequences for ESMCQwen
     )
+    
     train_loader = DataLoader(
         train_dataset,
         batch_size=args["batch_size_per_device"],
@@ -396,16 +418,16 @@ def train_on_device(
     )
     print(f"Eval dataset loaded on rank:{rank}")
 
-    torch.cuda.set_device(rank)
-
-    model = load_model(args=args)
-    model = model.to(rank)
-
     model = DistributedDataParallel(
         model, 
         # find_unused_parameters=True  # suppress error for unused parameters in wrapped model
     )
     print(f"DDP model loaded on rank:{rank}")
+    
+    # Enable gradient checkpointing if requested
+    if args["gradient_checkpointing"]:
+        model.module.gradient_checkpointing_enable()
+        print(f"Gradient checkpointing enabled on rank:{rank}")
 
     # initialization of the optimizer after wrapping the model
     optimizer = AdamW(

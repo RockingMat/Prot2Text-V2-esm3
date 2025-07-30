@@ -147,12 +147,12 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     """Core generation process for every device with batches over the whole dataset"""
     setup(rank, world_size)
 
-    # prepare dataset and dataloader
+    # Load model which handles all tokenizer setup internally
+    torch.cuda.set_device(rank)
+    model = load_model(args=args)
+    
+    llama_tokenizer = model.tokenizer
     esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        args["llama_path"], 
-        pad_token='<|reserved_special_token_0|>'
-    )
 
     generate_dataset = Prot2TextInstructDataset(
         root_dir=os.path.join(args["root_dataset_dir"], f"{args['generate_split']}"),
@@ -184,8 +184,6 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
         drop_last=True,
     )
 
-    # load base model and then the checkpoint and the adapter
-    model = load_model(args=args)
     
     # merge peft adapter for inference
     model = model.merge_and_unload()
