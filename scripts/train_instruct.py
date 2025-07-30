@@ -34,23 +34,23 @@ from torch.optim.lr_scheduler import StepLR
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers import EsmModel, LlamaForCausalLM
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
-    Esm2LlamaInstructForCausalLM
+    Esm2LlamaInstructForCausalLM,
+    ESMCConfig,
+    ESMCQwen
 )
+from esm.models.esmc import ESMC
 import scripts.utils_argparse as utils_argparse
 
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
-argParser.add_argument("--llama_path", type=str)
-# argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
 argParser.add_argument("--save_checkpoint_dir", type=str)
 argParser.add_argument("--load_model_checkpoint_path", type=str, default="")
@@ -85,30 +85,32 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     Load base model of the given name, and load weights from the checkpoint path 
     if provided.
     """
-    esm_encoder = EsmModel.from_pretrained(
-        args["esm_path"], 
-        add_pooling_layer=False,
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+    esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
+
+    llm_decoder = AutoModelForCausalLM.from_pretrained(
+        ESMCConfig.llm_model_name,
+        trust_remote_code=True,
+        torch_dtype=args["torch_dtype"],
+        device_map="auto",
     )
-    llama_decoder = LlamaForCausalLM.from_pretrained(
-        args["llama_path"], 
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
-        )
 
     adapter_config = ModalityAdapterConfig(
-        input_dim=esm_encoder.config.hidden_size,
+        input_dim=esm_encoder.embed.embedding_dim,
         intermediate_dim=2048,
-        output_dim=llama_decoder.config.hidden_size,
+        output_dim=llm_decoder.config.hidden_size,
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
+    model_cfg = ESMCConfig(
+        adapter_config=adapter_config,
+        llm_config=llm_decoder.config,
+    )
     
-    model = Esm2LlamaInstructForCausalLM(
+    model = ESMCQwen(
+        config=model_cfg,
         esm_encoder=esm_encoder,
         adapter=adapter,
-        llama_decoder=llama_decoder,
+        llm_decoder=llm_decoder,
     )
 
     # overwrite weights of base model if checkpoint path is provided
@@ -146,7 +148,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
                 "mlp.gate_proj", 
                 "mlp.up_proj", 
                 "mlp.down_proj"
-            ],  # for llama_decoder 
+            ],  # for llm_decoder 
             modules_to_save=(
                 ["adapter.fc1", "adapter.fc2"] 
                 if not args["fix_modality_adapter"] 
@@ -173,11 +175,10 @@ def teacher_forcing_forward_pass(
     Returned loss is not scaled with gradient accumulation steps.
     """
     return model(
+        protein_sequences=data_batch["protein_sequences"],  # List of raw sequences
         input_ids=data_batch["input_ids"].to(rank),
         attention_mask=data_batch["attention_mask"].to(rank),
         labels=data_batch["labels"].to(rank),
-        protein_input_ids=data_batch["protein_input_ids"].to(rank),
-        protein_attention_mask=data_batch["protein_attention_mask"].to(rank),
         use_cache=False,
         output_attentions=False, 
         output_hidden_states=False,
@@ -329,10 +330,10 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
     llama_tokenizer = AutoTokenizer.from_pretrained(
-        args["llama_path"], 
-        pad_token='<|reserved_special_token_0|>'
+        ESMCConfig.llm_model_name, 
+        pad_token='<|reserved_special_token_0|>',
+        trust_remote_code=True
     )
 
     train_dataset = Prot2TextLightDataset(
@@ -348,12 +349,13 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # ESMCQwen uses raw sequences
         description_tokenizer=llama_tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],
         name_dropout=args["name_dropout"],
         taxonomy_dropout=args["taxonomy_dropout"],
+        use_raw_sequences=True,  # Enable raw sequences for ESMCQwen
     )
     train_loader = DataLoader(
         train_dataset,
