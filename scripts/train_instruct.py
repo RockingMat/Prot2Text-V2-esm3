@@ -1,6 +1,6 @@
 """
 Stage 2 - instruction tuning training script for ESM-LLAMA protein description 
-generation on Esm2LlamaInstructForCausalLM model. 
+generation on ESMCQwen model. 
 
 With LoRA. 
 
@@ -29,19 +29,17 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim import Adam, AdamW, Optimizer
-from torch.optim.lr_scheduler import StepLR
+from torch.optim import AdamW, Optimizer
+from transformers import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers import EsmModel, LlamaForCausalLM
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
-    Esm2LlamaInstructForCausalLM,
     ESMCConfig,
     ESMCQwen
 )
@@ -62,12 +60,12 @@ argParser.add_argument("--batch_size_per_device", type=int)
 argParser.add_argument("--num_epochs", type=int)
 argParser.add_argument("--save_every_epochs", type=int)
 argParser.add_argument("--gradient_accumulation_steps", type=int)
-argParser.add_argument("--learning_rate", type=float)
+argParser.add_argument("--learning_rate", type=float, default=0.0002)
 argParser.add_argument("--gradient_clipping", type=float, default=None)
-argParser.add_argument("--scheduler_gamma", type=float)
+argParser.add_argument("--scheduler_gamma", type=float, default=0.95)
 argParser.add_argument("--random_seed", type=int)
 argParser.add_argument("--fix_modality_adapter", type=utils_argparse.str2bool)
-argParser.add_argument("--lora_rank", type=int)
+argParser.add_argument("--lora_rank", type=int, default=32)
 
 argParser.add_argument("--include_text_fields", type=utils_argparse.str2bool)
 argParser.add_argument("--name_dropout", type=float)
@@ -119,8 +117,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         model_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="cpu"  # load to CPU first
-            # will be loaded to where the weights were saved from if not specified
+            map_location="auto"
         )
         model.load_state_dict(model_state_dict)
 
@@ -158,6 +155,11 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         model = get_peft_model(model, lora_config)
 
     model.print_trainable_parameters()
+    
+    # Simple LoRA verification - check if adapters were added to expected components
+    esm_lora_count = sum(1 for name, _ in model.named_modules() if 'esm_encoder' in name and 'lora' in name)
+    llama_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
+    print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLaMA decoder has {llama_lora_count} LoRA modules")
 
     return model
 
@@ -209,6 +211,7 @@ def train_epoch(
         model: Union[DistributedDataParallel, FullyShardedDataParallel],
         dataloader: DataLoader,
         optimizer: Optimizer,
+        scheduler,
         args: Dict[str, Any]
 ):
     """Iterate over all batches for one epoch in training with teacher forcing"""
@@ -262,6 +265,7 @@ def train_epoch(
             ddp_gradnorm[1] += 1
 
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
     # summary current epoch
@@ -270,7 +274,7 @@ def train_epoch(
         print(
             f"[epoch={current_epoch}/{args['num_epochs']}, "
             f"train_loss={ddp_loss[0] / ddp_loss[1]}, "
-            f"epoch_lr={optimizer.param_groups[0]['lr']}, "
+            f"epoch_lr={scheduler.get_last_lr()[0]:.2e}, "
             f"epoch_gradnorm={ddp_gradnorm[0] / ddp_gradnorm[1]}]"
         )
         # NaN detection
@@ -404,8 +408,23 @@ def train_on_device(
     print(f"DDP model loaded on rank:{rank}")
 
     # initialization of the optimizer after wrapping the model
-    optimizer = Adam(model.parameters(), lr=args["learning_rate"])
-    scheduler = StepLR(optimizer, step_size=1, gamma=args["scheduler_gamma"])
+    optimizer = AdamW(
+        model.parameters(), 
+        lr=args["learning_rate"],
+        betas=(0.9, 0.999),
+        eps=1e-6,
+        weight_decay=0.01
+    )
+    
+    # Calculate total training steps for cosine scheduler with warmup
+    total_steps = len(train_loader) * args["num_epochs"] // args["gradient_accumulation_steps"]
+    warmup_steps = int(0.06 * total_steps)
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
     if args["load_optimizer_scheduler_checkpoint_path"]:
         print(f"Loading {args['load_optimizer_scheduler_checkpoint_path']}")
         checkpoint_state_dicts = torch.load(
@@ -428,9 +447,9 @@ def train_on_device(
             model=model,    
             dataloader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,  # Pass scheduler
             args=args
         )
-        scheduler.step()
         dist.barrier()  # use a barrier to make sure training is done on all ranks
         
         eval_epoch(
