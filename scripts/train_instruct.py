@@ -1,6 +1,6 @@
 """
 Stage 2 - instruction tuning training script for ESM-LLAMA protein description 
-generation on Esm2LlamaInstructForCausalLM model. 
+generation on ESMCQwen model. 
 
 With LoRA. 
 
@@ -29,52 +29,50 @@ import torch
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim import Adam, AdamW, Optimizer
-from torch.optim.lr_scheduler import StepLR
+from torch.optim import AdamW, Optimizer
+from transformers import get_cosine_schedule_with_warmup
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer
-from transformers import EsmModel, LlamaForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
     ModalityAdapter, 
     ModalityAdapterConfig, 
-    Esm2LlamaInstructForCausalLM
+    ESMCConfig,
+    ESMCQwen
 )
+from esm.models.esmc import ESMC
 import scripts.utils_argparse as utils_argparse
 
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
-argParser.add_argument("--llama_path", type=str)
-# argParser.add_argument("--root_dataset_dir", type=str)
-argParser.add_argument("--root_csv_dir", type=str)
-argParser.add_argument("--save_checkpoint_dir", type=str)
+argParser.add_argument("--root_csv_dir", type=str, default="./data")
+argParser.add_argument("--save_checkpoint_dir", type=str, default="./checkpoints")
 argParser.add_argument("--load_model_checkpoint_path", type=str, default="")
 argParser.add_argument("--load_adapter_checkpoint_dir", type=str, default="")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
 
-argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype)
-argParser.add_argument("--batch_size_per_device", type=int)
-argParser.add_argument("--num_epochs", type=int)
-argParser.add_argument("--save_every_epochs", type=int)
-argParser.add_argument("--gradient_accumulation_steps", type=int)
-argParser.add_argument("--learning_rate", type=float)
+argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="bfloat16")
+argParser.add_argument("--batch_size_per_device", type=int, default=8)
+argParser.add_argument("--num_epochs", type=int, default=24)
+argParser.add_argument("--save_every_epochs", type=int, default=1)
+argParser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+argParser.add_argument("--learning_rate", type=float, default=0.0002)
 argParser.add_argument("--gradient_clipping", type=float, default=None)
-argParser.add_argument("--scheduler_gamma", type=float)
-argParser.add_argument("--random_seed", type=int)
-argParser.add_argument("--fix_modality_adapter", type=utils_argparse.str2bool)
-argParser.add_argument("--lora_rank", type=int)
+argParser.add_argument("--scheduler_gamma", type=float, default=0.95)
+argParser.add_argument("--random_seed", type=int, default=42)
+argParser.add_argument("--fix_modality_adapter", type=utils_argparse.str2bool, default=False)
+argParser.add_argument("--lora_rank", type=int, default=32)
 
-argParser.add_argument("--include_text_fields", type=utils_argparse.str2bool)
-argParser.add_argument("--name_dropout", type=float)
-argParser.add_argument("--taxonomy_dropout", type=float)
+argParser.add_argument("--include_text_fields", type=utils_argparse.str2bool, default=True)
+argParser.add_argument("--name_dropout", type=float, default=0.0)
+argParser.add_argument("--taxonomy_dropout", type=float, default=0.0)
 
-argParser.add_argument("--train_split", type=str)
-argParser.add_argument("--eval_split", type=str)
+argParser.add_argument("--train_split", type=str, default="train")
+argParser.add_argument("--eval_split", type=str, default="validation")
 argParser.add_argument("--debug_trim_train_split", type=int, default=None)
 argParser.add_argument("--debug_trim_eval_split", type=int, default=None)
 
@@ -85,30 +83,32 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     Load base model of the given name, and load weights from the checkpoint path 
     if provided.
     """
-    esm_encoder = EsmModel.from_pretrained(
-        args["esm_path"], 
-        add_pooling_layer=False,
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
+    esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
+
+    llm_decoder = AutoModelForCausalLM.from_pretrained(
+        ESMCConfig.llm_model_name,
+        trust_remote_code=True,
+        torch_dtype=args["torch_dtype"],
+        device_map="auto",
     )
-    llama_decoder = LlamaForCausalLM.from_pretrained(
-        args["llama_path"], 
-        torch_dtype=args["torch_dtype"], 
-        device_map="cpu"
-        )
 
     adapter_config = ModalityAdapterConfig(
-        input_dim=esm_encoder.config.hidden_size,
+        input_dim=esm_encoder.embed.embedding_dim,
         intermediate_dim=2048,
-        output_dim=llama_decoder.config.hidden_size,
+        output_dim=llm_decoder.config.hidden_size,
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
+    model_cfg = ESMCConfig(
+        adapter_config=adapter_config,
+        llm_config=llm_decoder.config,
+    )
     
-    model = Esm2LlamaInstructForCausalLM(
+    model = ESMCQwen(
+        config=model_cfg,
         esm_encoder=esm_encoder,
         adapter=adapter,
-        llama_decoder=llama_decoder,
+        llm_decoder=llm_decoder,
     )
 
     # overwrite weights of base model if checkpoint path is provided
@@ -117,8 +117,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         model_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="cpu"  # load to CPU first
-            # will be loaded to where the weights were saved from if not specified
+            map_location="auto"
         )
         model.load_state_dict(model_state_dict)
 
@@ -146,7 +145,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
                 "mlp.gate_proj", 
                 "mlp.up_proj", 
                 "mlp.down_proj"
-            ],  # for llama_decoder 
+            ],  # for llm_decoder 
             modules_to_save=(
                 ["adapter.fc1", "adapter.fc2"] 
                 if not args["fix_modality_adapter"] 
@@ -156,6 +155,11 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         model = get_peft_model(model, lora_config)
 
     model.print_trainable_parameters()
+    
+    # Simple LoRA verification - check if adapters were added to expected components
+    esm_lora_count = sum(1 for name, _ in model.named_modules() if 'esm_encoder' in name and 'lora' in name)
+    llama_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
+    print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLaMA decoder has {llama_lora_count} LoRA modules")
 
     return model
 
@@ -173,11 +177,10 @@ def teacher_forcing_forward_pass(
     Returned loss is not scaled with gradient accumulation steps.
     """
     return model(
+        protein_sequences=data_batch["protein_sequences"],  # List of raw sequences
         input_ids=data_batch["input_ids"].to(rank),
         attention_mask=data_batch["attention_mask"].to(rank),
         labels=data_batch["labels"].to(rank),
-        protein_input_ids=data_batch["protein_input_ids"].to(rank),
-        protein_attention_mask=data_batch["protein_attention_mask"].to(rank),
         use_cache=False,
         output_attentions=False, 
         output_hidden_states=False,
@@ -208,6 +211,7 @@ def train_epoch(
         model: Union[DistributedDataParallel, FullyShardedDataParallel],
         dataloader: DataLoader,
         optimizer: Optimizer,
+        scheduler,
         args: Dict[str, Any]
 ):
     """Iterate over all batches for one epoch in training with teacher forcing"""
@@ -261,6 +265,7 @@ def train_epoch(
             ddp_gradnorm[1] += 1
 
             optimizer.step()
+            scheduler.step()
             optimizer.zero_grad(set_to_none=True)
 
     # summary current epoch
@@ -269,7 +274,7 @@ def train_epoch(
         print(
             f"[epoch={current_epoch}/{args['num_epochs']}, "
             f"train_loss={ddp_loss[0] / ddp_loss[1]}, "
-            f"epoch_lr={optimizer.param_groups[0]['lr']}, "
+            f"epoch_lr={scheduler.get_last_lr()[0]:.2e}, "
             f"epoch_gradnorm={ddp_gradnorm[0] / ddp_gradnorm[1]}]"
         )
         # NaN detection
@@ -329,10 +334,10 @@ def train_on_device(
     setup(rank, world_size)
 
     # prepare datasets and dataloaders
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
     llama_tokenizer = AutoTokenizer.from_pretrained(
-        args["llama_path"], 
-        pad_token='<|reserved_special_token_0|>'
+        ESMCConfig.llm_model_name, 
+        pad_token='<|reserved_special_token_0|>',
+        trust_remote_code=True
     )
 
     train_dataset = Prot2TextLightDataset(
@@ -348,12 +353,13 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
+        sequence_tokenizer=None,  # ESMCQwen uses raw sequences
         description_tokenizer=llama_tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],
         name_dropout=args["name_dropout"],
         taxonomy_dropout=args["taxonomy_dropout"],
+        use_raw_sequences=True,  # Enable raw sequences for ESMCQwen
     )
     train_loader = DataLoader(
         train_dataset,
@@ -402,8 +408,23 @@ def train_on_device(
     print(f"DDP model loaded on rank:{rank}")
 
     # initialization of the optimizer after wrapping the model
-    optimizer = Adam(model.parameters(), lr=args["learning_rate"])
-    scheduler = StepLR(optimizer, step_size=1, gamma=args["scheduler_gamma"])
+    optimizer = AdamW(
+        model.parameters(), 
+        lr=args["learning_rate"],
+        betas=(0.9, 0.999),
+        eps=1e-6,
+        weight_decay=0.01
+    )
+    
+    # Calculate total training steps for cosine scheduler with warmup
+    total_steps = len(train_loader) * args["num_epochs"] // args["gradient_accumulation_steps"]
+    warmup_steps = int(0.06 * total_steps)
+    
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_steps
+    )
     if args["load_optimizer_scheduler_checkpoint_path"]:
         print(f"Loading {args['load_optimizer_scheduler_checkpoint_path']}")
         checkpoint_state_dicts = torch.load(
@@ -426,9 +447,9 @@ def train_on_device(
             model=model,    
             dataloader=train_loader,
             optimizer=optimizer,
+            scheduler=scheduler,  # Pass scheduler
             args=args
         )
-        scheduler.step()
         dist.barrier()  # use a barrier to make sure training is done on all ranks
         
         eval_epoch(

@@ -28,11 +28,10 @@ import torch.utils.data
 import torch.distributed as dist
 from torch.distributed.fsdp import FullyShardedDataParallel
 from torch.nn.parallel import DistributedDataParallel
-from torch.optim import Adam, AdamW, Optimizer
-from torch.optim.lr_scheduler import StepLR
+from torch.optim import AdamW, Optimizer
 from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
-from transformers import AutoTokenizer, PreTrainedModel, get_cosine_schedule_with_warmup, AutoModelForCausalLM, EsmConfig
+from transformers import AutoTokenizer, PreTrainedModel, get_cosine_schedule_with_warmup, AutoModelForCausalLM
 
 from dataset import Prot2TextLightDataset, Prot2TextLightCollater
 from models import (
