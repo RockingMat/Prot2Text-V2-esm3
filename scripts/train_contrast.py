@@ -523,11 +523,9 @@ def train_on_device(
     )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # Not needed for raw sequences
         description_tokenizer=qwen_tokenizer,  # Qwen tokenizer for text
         mode="train",
         include_text_fields=True,
-        use_raw_sequences=True,  # Use raw sequences for ESMCQwen
     )
     
     train_loader = torch.utils.data.DataLoader(
@@ -558,11 +556,9 @@ def train_on_device(
     )
     
     eval_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # Not needed for raw sequences
         description_tokenizer=qwen_tokenizer,  # Qwen tokenizer for text
         mode="train",  # Use train mode for contrastive learning (need both sequences and descriptions)
         include_text_fields=True,
-        use_raw_sequences=True,  # Use raw sequences for ESMCQwen
     )
     
     eval_loader = torch.utils.data.DataLoader(

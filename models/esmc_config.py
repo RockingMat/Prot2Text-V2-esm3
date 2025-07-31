@@ -10,13 +10,9 @@ class ESMCConfig(PretrainedConfig):
     
     def __init__(
             self, 
-            # model components
             adapter_config: ModalityAdapterConfig,
             llm_config: PretrainedConfig, 
-            # standalone attributes
-            placeholder_id: int = 128003
     ):
         super().__init__()
         self.adapter_config = adapter_config
         self.llm_config = llm_config
-        self.placeholder_id = placeholder_id

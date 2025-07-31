@@ -27,7 +27,6 @@ import scripts.utils_argparse as utils_argparse
 
 argParser = argparse.ArgumentParser()
 
-argParser.add_argument("--esm_path", type=str)
 argParser.add_argument("--llama_path", type=str)
 argParser.add_argument("--root_dataset_dir", type=str)
 argParser.add_argument("--root_csv_dir", type=str)
@@ -74,10 +73,9 @@ def iterative_generation_loop(
         model = model.module  # for wrapper models, get the inner model for generation
 
     return model.generate(
-        inputs=data_batch["input_ids"].to(rank),
+        input_ids=data_batch["input_ids"].to(rank),
         attention_mask=data_batch["attention_mask"].to(rank),
-        protein_input_ids=data_batch["protein_input_ids"].to(rank),
-        protein_attention_mask=data_batch["protein_attention_mask"].to(rank),
+        protein_sequences=data_batch["protein_sequences"],
         max_new_tokens=max_generation_length,
         eos_token_id=128009, 
         pad_token_id=128002,
@@ -151,20 +149,19 @@ def inference_epoch(
 def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     """Core generation process for every device with batches over the whole dataset"""
     setup(rank, world_size)
- 
-    # prepare dataset and dataloader
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        args["llama_path"],
-        pad_token='<|reserved_special_token_0|>'
-    )
+    
+    # Load model which handles all tokenizer setup internally
+    torch.cuda.set_device(rank)
+    model = load_model(args=args)
+    
+    # Get tokenizer from the model to ensure consistency
+    llama_tokenizer = model.tokenizer
  
     generate_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['generate_split']}.csv")
     )
  
     generate_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
         description_tokenizer=llama_tokenizer,
         mode="inference",
         include_text_fields=True, 
@@ -213,7 +210,6 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     #)
 
     # load base model and then the checkpoint and the adapter
-    model = load_model(args=args)
     
     # if rank == 0:
     #     for name, param in model.named_parameters():
