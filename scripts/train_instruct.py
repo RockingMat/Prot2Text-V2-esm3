@@ -359,13 +359,11 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # ESMCQwen uses raw sequences
         description_tokenizer=llama_tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],
         name_dropout=args["name_dropout"],
         taxonomy_dropout=args["taxonomy_dropout"],
-        use_raw_sequences=True,  # Enable raw sequences for ESMCQwen
     )
     train_loader = DataLoader(
         train_dataset,

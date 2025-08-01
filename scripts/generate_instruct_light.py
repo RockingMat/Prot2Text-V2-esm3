@@ -76,8 +76,7 @@ def iterative_generation_loop(
     return model.generate(
         inputs=data_batch["input_ids"].to(rank),
         attention_mask=data_batch["attention_mask"].to(rank),
-        protein_input_ids=data_batch["protein_input_ids"].to(rank),
-        protein_attention_mask=data_batch["protein_attention_mask"].to(rank),
+        protein_sequences=data_batch["protein_sequences"],  # Raw sequences for ESMCQwen
         max_new_tokens=max_generation_length,
         eos_token_id=128009, 
         pad_token_id=128002,
@@ -153,7 +152,6 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     setup(rank, world_size)
  
     # prepare dataset and dataloader
-    esm_tokenizer = AutoTokenizer.from_pretrained(args["esm_path"])
     llama_tokenizer = AutoTokenizer.from_pretrained(
         args["llama_path"],
         pad_token='<|reserved_special_token_0|>'
@@ -164,7 +162,6 @@ def inference_on_device(rank: int, world_size: int, args: Dict[str, Any]):
     )
  
     generate_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
         description_tokenizer=llama_tokenizer,
         mode="inference",
         include_text_fields=True, 
