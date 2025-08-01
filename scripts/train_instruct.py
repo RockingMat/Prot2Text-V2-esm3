@@ -138,14 +138,20 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
             bias="none", 
             init_lora_weights=True, 
             target_modules=[
+                # LLM decoder modules
                 "self_attn.q_proj", 
                 "self_attn.k_proj", 
                 "self_attn.v_proj", 
                 "self_attn.o_proj", 
                 "mlp.gate_proj", 
                 "mlp.up_proj", 
-                "mlp.down_proj"
-            ],  # for llm_decoder 
+                "mlp.down_proj",
+                # ESM encoder modules
+                "layernorm_qkv.1",
+                "out_proj",
+                "ffn.1",
+                "ffn.3",
+            ], 
             modules_to_save=(
                 ["adapter.fc1", "adapter.fc2"] 
                 if not args["fix_modality_adapter"] 
