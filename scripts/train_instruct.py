@@ -92,6 +92,23 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         device_map="auto",
     )
 
+    # Configure tokenizer for Qwen model - add padding and placeholder tokens
+    llm_tokenizer = AutoTokenizer.from_pretrained(
+        ESMCConfig.llm_model_name,
+        trust_remote_code=True
+    )
+    
+    # Add padding token if not present
+    if llm_tokenizer.pad_token is None:
+        llm_tokenizer.add_special_tokens({'pad_token': '<|reserved_special_token_0|>'})
+        llm_decoder.resize_token_embeddings(len(llm_tokenizer))
+    
+    # Add placeholder token for protein embeddings if not present
+    placeholder_token = '<|reserved_special_token_1|>'
+    if placeholder_token not in llm_tokenizer.get_vocab():
+        llm_tokenizer.add_special_tokens({'additional_special_tokens': [placeholder_token]})
+        llm_decoder.resize_token_embeddings(len(llm_tokenizer))
+
     adapter_config = ModalityAdapterConfig(
         input_dim=esm_encoder.embed.embedding_dim,
         intermediate_dim=2048,
@@ -102,6 +119,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     model_cfg = ESMCConfig(
         adapter_config=adapter_config,
         llm_config=llm_decoder.config,
+        placeholder_id=llm_tokenizer.convert_tokens_to_ids(placeholder_token),
     )
     
     model = ESMCQwen(
@@ -109,6 +127,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         esm_encoder=esm_encoder,
         adapter=adapter,
         llm_decoder=llm_decoder,
+        llm_tokenizer=llm_tokenizer,
     )
 
     # overwrite weights of base model if checkpoint path is provided
@@ -339,12 +358,8 @@ def train_on_device(
     """
     setup(rank, world_size)
 
-    # prepare datasets and dataloaders
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        ESMCConfig.llm_model_name, 
-        pad_token='<|reserved_special_token_0|>',
-        trust_remote_code=True
-    )
+    torch.cuda.set_device(rank)
+    model = load_model(args=args)
 
     train_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv"),
@@ -359,7 +374,8 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        description_tokenizer=llama_tokenizer,
+        description_tokenizer=model.llm_tokenizer,
+        esm_tokenizer=model.esm_encoder.tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],
         name_dropout=args["name_dropout"],
@@ -400,9 +416,6 @@ def train_on_device(
     )
     print(f"Eval dataset loaded on rank:{rank}")
 
-    torch.cuda.set_device(rank)
-
-    model = load_model(args=args)
     model = model.to(rank)
 
     model = DistributedDataParallel(

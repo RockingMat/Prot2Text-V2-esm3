@@ -14,7 +14,8 @@ from typing import Optional, Union, List, Tuple
 import torch
 from transformers import (
     AutoModelForCausalLM,
-    PreTrainedModel
+    PreTrainedModel,
+    PreTrainedTokenizer
 )
 from transformers.generation.utils import GenerateOutput
 from transformers.modeling_outputs import CausalLMOutputWithPast
@@ -36,12 +37,14 @@ class ESMCQwen(PreTrainedModel):
         config: ESMCConfig,
         esm_encoder: ESMC,
         adapter: ModalityAdapter,
-        llm_decoder: AutoModelForCausalLM
+        llm_decoder: AutoModelForCausalLM,
+        llm_tokenizer: PreTrainedTokenizer
     ):
         super().__init__(config)
         self.esm_encoder = esm_encoder
         self.adapter = adapter
         self.llm_decoder = llm_decoder
+        self.llm_tokenizer = llm_tokenizer
 
     def encode_protein_sequences(self, protein_sequences: List[str]) -> Tuple[torch.Tensor, torch.Tensor]:
         """

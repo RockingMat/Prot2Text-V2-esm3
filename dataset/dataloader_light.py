@@ -52,6 +52,7 @@ Example of usage for ESMCQwen:
 >>> train_dataset = Prot2TextLightDataset("./data/train.csv")
 >>> train_collater = Prot2TextLightCollater(
         description_tokenizer=qwen_tokenizer,
+        esm_tokenizer=esm_tokenizer,
         mode="train"
     )
 >>> train_dataloader = DataLoader(
@@ -72,6 +73,9 @@ import pandas as pd
 import torch
 import torch.utils.data
 from transformers import PreTrainedTokenizer
+
+# Import ESM utilities for proper sequence tokenization
+from esm.utils import encoding
 
 
 class Prot2TextLightDataset(torch.utils.data.Dataset): 
@@ -94,6 +98,7 @@ class Prot2TextLightCollater:
     def __init__(
             self, 
             description_tokenizer: PreTrainedTokenizer,
+            esm_tokenizer: PreTrainedTokenizer,
             mode: Literal["train", "inference"] = "train", 
             include_text_fields: bool = True,
             name_dropout: float = 0.8, 
@@ -109,6 +114,7 @@ class Prot2TextLightCollater:
             placeholder_token: str = '<|reserved_special_token_1|>',
     ):
         self.description_tokenizer = description_tokenizer
+        self.esm_tokenizer = esm_tokenizer
         self.mode = mode
 
         self.include_text_fields = include_text_fields
@@ -119,6 +125,27 @@ class Prot2TextLightCollater:
         self.max_description_length = max_description_length
         self.system_message = system_message
         self.placeholder_token = placeholder_token
+
+    def _calculate_sequence_length(self, sequence: str) -> int:
+        """
+        Calculate sequence length using ESM tokenization technique.
+        
+        This method replicates the tokenization approach from encode_protein_sequences
+        in ESMCQwen to ensure consistent sequence length calculation.
+        
+        Args:
+            sequence: Raw protein sequence string
+            
+        Returns:
+            Length of the tokenized sequence (including special tokens)
+        """
+        # Use the same tokenization approach as encode_protein_sequences
+        tokenized_sequence = encoding.tokenize_sequence(
+            sequence, 
+            self.esm_tokenizer, 
+            add_special_tokens=True
+        )
+        return len(tokenized_sequence)
 
     def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, Union[List[str], torch.Tensor]]:
         # group data across batch
@@ -151,8 +178,7 @@ class Prot2TextLightCollater:
             else:
                 processed_sequences.append(sequence)
 
-        # Use raw sequences for ESMCQwen
-        sequence_lens = [len(seq) for seq in processed_sequences]
+        sequence_lens = [self._calculate_sequence_length(seq) for seq in processed_sequences]
 
         if self.include_text_fields: 
             user_messages = [
