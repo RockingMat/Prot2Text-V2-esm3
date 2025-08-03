@@ -57,10 +57,10 @@ argParser.add_argument("--load_adapter_checkpoint_dir", type=str, default="")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
 
 argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="bfloat16")
-argParser.add_argument("--batch_size_per_device", type=int, default=4)
+argParser.add_argument("--batch_size_per_device", type=int, default=2)
 argParser.add_argument("--num_epochs", type=int, default=24)
 argParser.add_argument("--save_every_epochs", type=int, default=1)
-argParser.add_argument("--gradient_accumulation_steps", type=int, default=16)
+argParser.add_argument("--gradient_accumulation_steps", type=int, default=32)
 argParser.add_argument("--learning_rate", type=float, default=0.0002)
 argParser.add_argument("--gradient_clipping", type=float, default=None)
 argParser.add_argument("--scheduler_gamma", type=float, default=0.95)
@@ -182,15 +182,7 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PeftModel:
         )
         model = get_peft_model(model, lora_config)
 
-    model.print_trainable_parameters()
-    
-    # Simple LoRA verification - check if adapters were added to expected components
-    esm_lora_count = sum(1 for name, _ in model.named_modules() if 'esm_encoder' in name and 'lora' in name)
-    llama_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
-    print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLaMA decoder has {llama_lora_count} LoRA modules")
-
     model = model.to(f"cuda:{device_rank}")
-
     gc.collect()
     torch.cuda.empty_cache()
 
