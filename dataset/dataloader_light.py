@@ -1,6 +1,6 @@
 """
 Light-weight dataset and data collater class for protein function prediction 
-instruction tuning. Compatible with both Esm2LlamaInstructForCausalLM and ESMCQwen models.
+instruction tuning. Compatible with ESMCQwen models.
 
 Such flexible implementation is designed to fetch raw text data from a CSV file 
 and perform tokenization and padding on-the-fly. This is useful when the default 
@@ -8,18 +8,13 @@ user message and chat template is not suitable for the task at hand.
 
 Can only be used if the model is not requiring graph-related data.
 
-The collater supports two modes for protein sequences:
-1. Tokenized sequences (use_raw_sequences=False) - for Esm2LlamaInstructForCausalLM
-2. Raw sequences (use_raw_sequences=True) - for ESMCQwen and similar models
+The collater uses raw protein sequences for ESMCQwen models.
 
 Every batch from DataLoader will contain following attributes:
     * Training mode (train-eval with teacher-forcing): 
         - graph related features:
             None
-        - amino-acid sequence (when use_raw_sequences=False): 
-            - protein_input_ids (bsz, max_seq_len+2)  # bos and eos tokens
-            - protein_attention_mask (bsz, max_seq_len+2)  # right padding
-        - amino-acid sequence (when use_raw_sequences=True):
+        - amino-acid sequence:
             - protein_sequences (List[str])  # raw protein sequences
         - concatenated chat:
             - input_ids (bsz, max_prompt_len+max_text_len+1)
@@ -38,10 +33,7 @@ Every batch from DataLoader will contain following attributes:
     * Inference mode (iterative generation):
         - graph related features: 
             None
-        - amino-acid sequence (when use_raw_sequences=False): 
-            - protein_input_ids (bsz, max_seq_len+2)  # bos and eos tokens
-            - protein_attention_mask (bsz, max_seq_len+2)  # right padding
-        - amino-acid sequence (when use_raw_sequences=True):
+        - amino-acid sequence:
             - protein_sequences (List[str])  # raw protein sequences
         - prompt chat: 
             - input_ids (bsz, max_prompt_len)
@@ -52,21 +44,16 @@ Every batch from DataLoader will contain following attributes:
         mask     = [0s       + 1   + 1s     & ]
         desc_ids =                        [ & description + eot + right-pad]
 
-Example of usage for Esm2LlamaInstructForCausalLM: 
+Example of usage for ESMCQwen:
 >>> from torch.utils.data import DataLoader
 >>> from transformers import AutoTokenizer
 >>> from dataset import Prot2TextLightDataset, Prot2TextLightCollater
->>> esm_tokenizer = AutoTokenizer.from_pretrained("/data/esm2_t33_650M_UR50D")
->>> llama_tokenizer = AutoTokenizer.from_pretrained(
-        "/data/Meta-Llama-3.1-8B-Instruct-hf", 
-        pad_token='<|reserved_special_token_0|>'
-    )
+>>> qwen_tokenizer = AutoTokenizer.from_pretrained("/data/Qwen-hf")
 >>> train_dataset = Prot2TextLightDataset("./data/train.csv")
 >>> train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=esm_tokenizer,
-        description_tokenizer=llama_tokenizer,
-        mode="train",
-        use_raw_sequences=False  # Use tokenized sequences
+        description_tokenizer=qwen_tokenizer,
+        esm_tokenizer=esm_tokenizer,
+        mode="train"
     )
 >>> train_dataloader = DataLoader(
         train_dataset,
@@ -77,14 +64,6 @@ Example of usage for Esm2LlamaInstructForCausalLM:
         pin_memory=True, 
         drop_last=True
     )
-
-Example of usage for ESMCQwen:
->>> train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # Not needed for raw sequences
-        description_tokenizer=qwen_tokenizer,
-        mode="train",
-        use_raw_sequences=True  # Use raw sequences
-    )
 """
 
 import random
@@ -94,6 +73,9 @@ import pandas as pd
 import torch
 import torch.utils.data
 from transformers import PreTrainedTokenizer
+
+# Import ESM utilities for proper sequence tokenization
+from esm.utils import encoding
 
 
 class Prot2TextLightDataset(torch.utils.data.Dataset): 
@@ -115,8 +97,8 @@ class Prot2TextLightDataset(torch.utils.data.Dataset):
 class Prot2TextLightCollater: 
     def __init__(
             self, 
-            sequence_tokenizer: Optional[PreTrainedTokenizer],
             description_tokenizer: PreTrainedTokenizer,
+            esm_tokenizer: PreTrainedTokenizer,
             mode: Literal["train", "inference"] = "train", 
             include_text_fields: bool = True,
             name_dropout: float = 0.8, 
@@ -129,11 +111,10 @@ class Prot2TextLightCollater:
                 "of a protein, describe its function clearly and concisely in "
                 "professional language. "
             ), 
-            placeholder_token: str = '<|reserved_special_token_1|>', 
-            use_raw_sequences: bool = False,
+            placeholder_token: str = '<|reserved_special_token_1|>',
     ):
-        self.sequence_tokenizer = sequence_tokenizer
         self.description_tokenizer = description_tokenizer
+        self.esm_tokenizer = esm_tokenizer
         self.mode = mode
 
         self.include_text_fields = include_text_fields
@@ -144,14 +125,27 @@ class Prot2TextLightCollater:
         self.max_description_length = max_description_length
         self.system_message = system_message
         self.placeholder_token = placeholder_token
-        self.use_raw_sequences = use_raw_sequences
 
-        # Validation
-        if not use_raw_sequences and sequence_tokenizer is None:
-            raise ValueError("sequence_tokenizer must be provided when use_raw_sequences=False")
-        if use_raw_sequences and sequence_tokenizer is not None:
-            import warnings
-            warnings.warn("sequence_tokenizer provided but will be ignored when use_raw_sequences=True")
+    def _calculate_sequence_length(self, sequence: str) -> int:
+        """
+        Calculate sequence length using ESM tokenization technique.
+        
+        This method replicates the tokenization approach from encode_protein_sequences
+        in ESMCQwen to ensure consistent sequence length calculation.
+        
+        Args:
+            sequence: Raw protein sequence string
+            
+        Returns:
+            Length of the tokenized sequence (including special tokens)
+        """
+        # Use the same tokenization approach as encode_protein_sequences
+        tokenized_sequence = encoding.tokenize_sequence(
+            sequence, 
+            self.esm_tokenizer, 
+            add_special_tokens=True
+        )
+        return len(tokenized_sequence)
 
     def __call__(self, batch: List[Dict[str, str]]) -> Dict[str, Union[List[str], torch.Tensor]]:
         # group data across batch
@@ -184,25 +178,7 @@ class Prot2TextLightCollater:
             else:
                 processed_sequences.append(sequence)
 
-        # Handle protein sequences based on mode
-        if self.use_raw_sequences:
-            # Keep sequences as raw strings for models like ESMCQwen
-            sequence_input_ids = None
-            sequence_attention_mask = None
-            sequence_lens = [len(seq) for seq in processed_sequences]
-        else:
-            # Tokenize sequences for models like Esm2LlamaInstruct
-            self.sequence_tokenizer.padding_side = "right"
-            tokenized_sequences = self.sequence_tokenizer(
-                processed_sequences, 
-                truncation=True, 
-                padding="longest", 
-                max_length=self.max_sequence_length + 2,  # including bos and eos tokens
-                return_tensors="pt"
-            )
-            sequence_input_ids = tokenized_sequences["input_ids"]
-            sequence_attention_mask = tokenized_sequences["attention_mask"]
-            sequence_lens = sequence_attention_mask.sum(dim=1).tolist()
+        sequence_lens = [self._calculate_sequence_length(seq) for seq in processed_sequences]
 
         if self.include_text_fields: 
             user_messages = [
@@ -269,16 +245,10 @@ class Prot2TextLightCollater:
         # assemble return dictionary
         result = {
             "name": accessions,
+            "protein_sequences": processed_sequences,
             "description_input_ids": description_input_ids,
             "description_attention_mask": description_attention_mask
         }
-        
-        # Add protein data based on mode
-        if self.use_raw_sequences:
-            result["protein_sequences"] = processed_sequences
-        else:
-            result["protein_input_ids"] = sequence_input_ids
-            result["protein_attention_mask"] = sequence_attention_mask
         
         # Add text data based on train/inference mode
         if self.mode == "train": 

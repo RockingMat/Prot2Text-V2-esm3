@@ -125,7 +125,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     and scheduler state dict.
     """
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
-    esm_encoder = esm_encoder.to(f"cuda:{device_rank}")
 
     llm_decoder = AutoModelForCausalLM.from_pretrained(
         ESMCConfig.llm_model_name,
@@ -133,7 +132,23 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
         torch_dtype=args["torch_dtype"],
         low_cpu_mem_usage=True,
     )
-    llm_decoder = llm_decoder.to(f"cuda:{device_rank}")
+
+    # Configure tokenizer for Qwen model - add padding and placeholder tokens
+    llm_tokenizer = AutoTokenizer.from_pretrained(
+        ESMCConfig.llm_model_name,
+        trust_remote_code=True
+    )
+    
+    # Add padding token if not present
+    if llm_tokenizer.pad_token is None:
+        llm_tokenizer.add_special_tokens({'pad_token': '<|reserved_special_token_0|>'})
+        llm_decoder.resize_token_embeddings(len(llm_tokenizer))
+    
+    # Add placeholder token for protein embeddings if not present
+    placeholder_token = '<|reserved_special_token_1|>'
+    if placeholder_token not in llm_tokenizer.get_vocab():
+        llm_tokenizer.add_special_tokens({'additional_special_tokens': [placeholder_token]})
+        llm_decoder.resize_token_embeddings(len(llm_tokenizer))
 
     adapter_config = ModalityAdapterConfig(
         input_dim=esm_encoder.embed.embedding_dim,
@@ -142,11 +157,11 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
-    adapter = adapter.to(f"cuda:{device_rank}")
     
     model_cfg = ESMCConfig(
         adapter_config=adapter_config,
         llm_config=llm_decoder.config,
+        placeholder_id=llm_tokenizer.convert_tokens_to_ids(placeholder_token),
     )
     
     model = ESMCQwen(
@@ -154,6 +169,7 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
         esm_encoder=esm_encoder,
         adapter=adapter,
         llm_decoder=llm_decoder,
+        llm_tokenizer=llm_tokenizer,
     )
 
     if args["load_model_checkpoint_path"]:
@@ -169,6 +185,8 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     # WARNING: esm and llm weights are fixed
     model.esm_encoder.requires_grad_(False)
     model.llm_decoder.requires_grad_(False)
+
+    model = model.to(f"cuda:{device_rank}")
 
     # Clean up temporary memory
     gc.collect()
@@ -512,14 +530,15 @@ def train_on_device(
     """
     setup(rank, world_size)
 
-    # prepare datasets and dataloaders
-    # For ESMCQwen: 
-    # - ESMC handles raw protein sequences (no tokenizer needed)
-    # - Qwen 14B handles text (use AutoTokenizer)
-    qwen_tokenizer = AutoTokenizer.from_pretrained(
-        ESMCConfig.llm_model_name,  # "Qwen/Qwen3-14B"
-        pad_token='<|reserved_special_token_0|>'
-    )
+    # Load model
+    model = load_model(args=args, device_rank=rank)
+    
+    # Ensure all models are loaded before proceeding with DDP
+    torch.cuda.synchronize()
+    dist.barrier()
+    
+    esm_tokenizer = model.esm_encoder.tokenizer
+    qwen_tokenizer = model.llm_tokenizer
 
     train_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv")
@@ -537,11 +556,10 @@ def train_on_device(
     )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # Not needed for raw sequences
-        description_tokenizer=qwen_tokenizer,  # Qwen tokenizer for text
+        description_tokenizer=qwen_tokenizer,
+        esm_tokenizer=esm_tokenizer,
         mode="train",
         include_text_fields=True,
-        use_raw_sequences=True,  # Use raw sequences for ESMCQwen
     )
     
     train_loader = torch.utils.data.DataLoader(
@@ -572,11 +590,10 @@ def train_on_device(
     )
     
     eval_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # Not needed for raw sequences
-        description_tokenizer=qwen_tokenizer,  # Qwen tokenizer for text
+        description_tokenizer=qwen_tokenizer,
+        esm_tokenizer=esm_tokenizer,
         mode="train",  # Use train mode for contrastive learning (need both sequences and descriptions)
         include_text_fields=True,
-        use_raw_sequences=True,  # Use raw sequences for ESMCQwen
     )
     
     eval_loader = torch.utils.data.DataLoader(
@@ -590,15 +607,6 @@ def train_on_device(
         collate_fn=eval_collater,
     )
     print(f"Eval dataset loaded on rank:{rank}")
-
-    torch.cuda.set_device(rank)
-
-    # Load model directly to GPU (no .to(rank) needed since model is already on correct device)
-    model = load_model(args=args, device_rank=rank)
-    
-    # Ensure all models are loaded before proceeding with DDP
-    torch.cuda.synchronize()
-    dist.barrier()
 
     model = DistributedDataParallel(
         model, 

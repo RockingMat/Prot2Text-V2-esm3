@@ -20,6 +20,7 @@ reference for AMP: https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html
 
 import argparse
 from datetime import datetime
+import gc
 import os
 from typing import Any, Dict, Union
 
@@ -56,10 +57,10 @@ argParser.add_argument("--load_adapter_checkpoint_dir", type=str, default="")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
 
 argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="bfloat16")
-argParser.add_argument("--batch_size_per_device", type=int, default=8)
+argParser.add_argument("--batch_size_per_device", type=int, default=1)
 argParser.add_argument("--num_epochs", type=int, default=24)
 argParser.add_argument("--save_every_epochs", type=int, default=1)
-argParser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+argParser.add_argument("--gradient_accumulation_steps", type=int, default=32)
 argParser.add_argument("--learning_rate", type=float, default=0.0002)
 argParser.add_argument("--gradient_clipping", type=float, default=None)
 argParser.add_argument("--scheduler_gamma", type=float, default=0.95)
@@ -77,7 +78,7 @@ argParser.add_argument("--debug_trim_train_split", type=int, default=None)
 argParser.add_argument("--debug_trim_eval_split", type=int, default=None)
 
 
-def load_model(args: Dict[str, Any]) -> PeftModel:
+def load_model(args: Dict[str, Any], device_rank: int) -> PeftModel:
     """
     Standard API for different models. Used in both `train` and `generate`.
     Load base model of the given name, and load weights from the checkpoint path 
@@ -89,8 +90,25 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         ESMCConfig.llm_model_name,
         trust_remote_code=True,
         torch_dtype=args["torch_dtype"],
-        device_map="auto",
+        low_cpu_mem_usage=True,
     )
+
+    # Configure tokenizer for Qwen model - add padding and placeholder tokens
+    llm_tokenizer = AutoTokenizer.from_pretrained(
+        ESMCConfig.llm_model_name,
+        trust_remote_code=True
+    )
+    
+    # Add padding token if not present
+    if llm_tokenizer.pad_token is None:
+        llm_tokenizer.add_special_tokens({'pad_token': '<|reserved_special_token_0|>'})
+        llm_decoder.resize_token_embeddings(len(llm_tokenizer))
+    
+    # Add placeholder token for protein embeddings if not present
+    placeholder_token = '<|reserved_special_token_1|>'
+    if placeholder_token not in llm_tokenizer.get_vocab():
+        llm_tokenizer.add_special_tokens({'additional_special_tokens': [placeholder_token]})
+        llm_decoder.resize_token_embeddings(len(llm_tokenizer))
 
     adapter_config = ModalityAdapterConfig(
         input_dim=esm_encoder.embed.embedding_dim,
@@ -99,9 +117,11 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
+    
     model_cfg = ESMCConfig(
         adapter_config=adapter_config,
         llm_config=llm_decoder.config,
+        placeholder_id=llm_tokenizer.convert_tokens_to_ids(placeholder_token),
     )
     
     model = ESMCQwen(
@@ -109,6 +129,7 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         esm_encoder=esm_encoder,
         adapter=adapter,
         llm_decoder=llm_decoder,
+        llm_tokenizer=llm_tokenizer,
     )
 
     # overwrite weights of base model if checkpoint path is provided
@@ -117,7 +138,8 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         model_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="auto"
+            map_location=f"cuda:{device_rank}",
+            low_cpu_mem_usage=True
         )
         model.load_state_dict(model_state_dict)
 
@@ -138,14 +160,20 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
             bias="none", 
             init_lora_weights=True, 
             target_modules=[
+                # LLM decoder modules
                 "self_attn.q_proj", 
                 "self_attn.k_proj", 
                 "self_attn.v_proj", 
                 "self_attn.o_proj", 
                 "mlp.gate_proj", 
                 "mlp.up_proj", 
-                "mlp.down_proj"
-            ],  # for llm_decoder 
+                "mlp.down_proj",
+                # ESM encoder modules
+                "layernorm_qkv.1",
+                "out_proj",
+                "ffn.1",
+                "ffn.3",
+            ], 
             modules_to_save=(
                 ["adapter.fc1", "adapter.fc2"] 
                 if not args["fix_modality_adapter"] 
@@ -154,12 +182,9 @@ def load_model(args: Dict[str, Any]) -> PeftModel:
         )
         model = get_peft_model(model, lora_config)
 
-    model.print_trainable_parameters()
-    
-    # Simple LoRA verification - check if adapters were added to expected components
-    esm_lora_count = sum(1 for name, _ in model.named_modules() if 'esm_encoder' in name and 'lora' in name)
-    llama_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
-    print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLaMA decoder has {llama_lora_count} LoRA modules")
+    model = model.to(f"cuda:{device_rank}")
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return model
 
@@ -197,7 +222,8 @@ def setup(rank: int, world_size: int):
     os.environ['MASTER_ADDR'] = os.getenv('MASTER_ADDR', 'localhost')
     os.environ['MASTER_PORT'] = os.getenv('MASTER_PORT', '9901')
     # initialize the process group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=torch.device(f"cuda:{rank}"))
+    torch.cuda.set_device(rank)
 
 
 def cleanup():
@@ -333,12 +359,10 @@ def train_on_device(
     """
     setup(rank, world_size)
 
-    # prepare datasets and dataloaders
-    llama_tokenizer = AutoTokenizer.from_pretrained(
-        ESMCConfig.llm_model_name, 
-        pad_token='<|reserved_special_token_0|>',
-        trust_remote_code=True
-    )
+    model = load_model(args=args, device_rank=rank)
+    
+    torch.cuda.synchronize()
+    dist.barrier()
 
     train_dataset = Prot2TextLightDataset(
         csv_path=os.path.join(args["root_csv_dir"], f"{args['train_split']}.csv"),
@@ -353,13 +377,12 @@ def train_on_device(
         )
     
     train_collater = Prot2TextLightCollater(
-        sequence_tokenizer=None,  # ESMCQwen uses raw sequences
-        description_tokenizer=llama_tokenizer,
+        description_tokenizer=model.llm_tokenizer,
+        esm_tokenizer=model.esm_encoder.tokenizer,
         mode="train", 
         include_text_fields=args["include_text_fields"],
         name_dropout=args["name_dropout"],
         taxonomy_dropout=args["taxonomy_dropout"],
-        use_raw_sequences=True,  # Enable raw sequences for ESMCQwen
     )
     train_loader = DataLoader(
         train_dataset,
@@ -396,16 +419,13 @@ def train_on_device(
     )
     print(f"Eval dataset loaded on rank:{rank}")
 
-    torch.cuda.set_device(rank)
-
-    model = load_model(args=args)
-    model = model.to(rank)
-
     model = DistributedDataParallel(
         model, 
         # find_unused_parameters=True  # suppress error for unused parameters in wrapped model
     )
-    print(f"DDP model loaded on rank:{rank}")
+    
+    torch.cuda.synchronize()
+    dist.barrier()
 
     # initialization of the optimizer after wrapping the model
     optimizer = AdamW(
@@ -511,8 +531,23 @@ if __name__ == '__main__':
     # suppress messages from AutoTokenizer parallelism and Graphein respectively
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     os.environ["LOGURU_LEVEL"] = "INFO"
+    
+    # Memory optimization settings
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
+    
+    # Initial memory cleanup
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     parsed_args = argParser.parse_args()
+    
+    # Print help information about model paths
+    print("####################")
+    print("ESMCQwen Instruction Tuning")
+    print(f"Using ESM model: {ESMCConfig.esm_model_name}")
+    print(f"Using LLM model: {ESMCConfig.llm_model_name}")
+    print("####################")
+    
     # os.environ['CUDA_VISIBLE_DEVICES'] = '1'  # restrict GPU visibility
     parsed_args.world_size = torch.cuda.device_count()  # use up all visible GPUs
 
