@@ -125,7 +125,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     and scheduler state dict.
     """
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
-    esm_encoder = esm_encoder.to(f"cuda:{device_rank}")
 
     llm_decoder = AutoModelForCausalLM.from_pretrained(
         ESMCConfig.llm_model_name,
@@ -133,7 +132,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
         torch_dtype=args["torch_dtype"],
         low_cpu_mem_usage=True,
     )
-    llm_decoder = llm_decoder.to(f"cuda:{device_rank}")
 
     # Configure tokenizer for Qwen model - add padding and placeholder tokens
     llm_tokenizer = AutoTokenizer.from_pretrained(
@@ -159,7 +157,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
-    adapter = adapter.to(f"cuda:{device_rank}")
     
     model_cfg = ESMCConfig(
         adapter_config=adapter_config,
@@ -188,6 +185,8 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     # WARNING: esm and llm weights are fixed
     model.esm_encoder.requires_grad_(False)
     model.llm_decoder.requires_grad_(False)
+
+    model = model.to(f"cuda:{device_rank}")
 
     # Clean up temporary memory
     gc.collect()

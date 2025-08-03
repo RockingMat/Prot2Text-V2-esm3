@@ -57,10 +57,10 @@ argParser.add_argument("--load_adapter_checkpoint_dir", type=str, default="")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
 
 argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="bfloat16")
-argParser.add_argument("--batch_size_per_device", type=int, default=8)
+argParser.add_argument("--batch_size_per_device", type=int, default=4)
 argParser.add_argument("--num_epochs", type=int, default=24)
 argParser.add_argument("--save_every_epochs", type=int, default=1)
-argParser.add_argument("--gradient_accumulation_steps", type=int, default=8)
+argParser.add_argument("--gradient_accumulation_steps", type=int, default=16)
 argParser.add_argument("--learning_rate", type=float, default=0.0002)
 argParser.add_argument("--gradient_clipping", type=float, default=None)
 argParser.add_argument("--scheduler_gamma", type=float, default=0.95)
@@ -85,7 +85,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PeftModel:
     if provided.
     """
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
-    esm_encoder = esm_encoder.to(f"cuda:{device_rank}")
 
     llm_decoder = AutoModelForCausalLM.from_pretrained(
         ESMCConfig.llm_model_name,
@@ -93,7 +92,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PeftModel:
         torch_dtype=args["torch_dtype"],
         low_cpu_mem_usage=True,
     )
-    llm_decoder = llm_decoder.to(f"cuda:{device_rank}")
 
     # Configure tokenizer for Qwen model - add padding and placeholder tokens
     llm_tokenizer = AutoTokenizer.from_pretrained(
@@ -119,7 +117,6 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PeftModel:
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
-    adapter = adapter.to(f"cuda:{device_rank}")
     
     model_cfg = ESMCConfig(
         adapter_config=adapter_config,
@@ -191,6 +188,8 @@ def load_model(args: Dict[str, Any], device_rank: int) -> PeftModel:
     esm_lora_count = sum(1 for name, _ in model.named_modules() if 'esm_encoder' in name and 'lora' in name)
     llama_lora_count = sum(1 for name, _ in model.named_modules() if 'llm_decoder' in name and 'lora' in name)
     print(f"LoRA verification: ESM encoder has {esm_lora_count} LoRA modules, LLaMA decoder has {llama_lora_count} LoRA modules")
+
+    model = model.to(f"cuda:{device_rank}")
 
     gc.collect()
     torch.cuda.empty_cache()
@@ -542,7 +541,7 @@ if __name__ == '__main__':
     os.environ["LOGURU_LEVEL"] = "INFO"
     
     # Memory optimization settings
-    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:64"
     
     # Initial memory cleanup
     gc.collect()
