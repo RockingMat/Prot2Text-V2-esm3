@@ -20,6 +20,7 @@ reference for AMP: https://pytorch.org/tutorials/recipes/recipes/amp_recipe.html
 
 import argparse
 from datetime import datetime
+import gc
 import os
 from typing import Any, Dict, Literal, Union
 
@@ -113,24 +114,26 @@ class SegmentedBatchInfoNCELoss(torch.nn.Module):
         return - torch.log(numerator / denominator).mean()
 
 
-def load_model(args: Dict[str, Any]) -> PreTrainedModel:
+def load_model(args: Dict[str, Any], device_rank: int) -> PreTrainedModel:
     """
     Standard API for different models. Used in both `train` and `generate`.
     Load base model of the given name, and load weights from the checkpoint path 
     if provided.
 
-    Returned model should be on CPU and under default data type.
+    Models are loaded directly to the specified GPU device to avoid CPU memory issues.
     A general checkpoint shall contain the model state dict, optimizer state dict,
     and scheduler state dict.
     """
     esm_encoder = ESMC.from_pretrained(ESMCConfig.esm_model_name)
+    esm_encoder = esm_encoder.to(f"cuda:{device_rank}")
 
     llm_decoder = AutoModelForCausalLM.from_pretrained(
         ESMCConfig.llm_model_name,
         trust_remote_code=True,
         torch_dtype=args["torch_dtype"],
-        device_map="auto",
+        low_cpu_mem_usage=True,
     )
+    llm_decoder = llm_decoder.to(f"cuda:{device_rank}")
 
     adapter_config = ModalityAdapterConfig(
         input_dim=esm_encoder.embed.embedding_dim,
@@ -139,6 +142,8 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     )
     adapter = ModalityAdapter(adapter_config)
     adapter.to(args["torch_dtype"])
+    adapter = adapter.to(f"cuda:{device_rank}")
+    
     model_cfg = ESMCConfig(
         adapter_config=adapter_config,
         llm_config=llm_decoder.config,
@@ -156,7 +161,7 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
         adapter_state_dict = torch.load(
             args["load_model_checkpoint_path"], 
             weights_only=True, 
-            map_location="auto",
+            map_location=f"cuda:{device_rank}",
             low_cpu_mem_usage=True
         )
         model.adapter.load_state_dict(adapter_state_dict)
@@ -164,6 +169,10 @@ def load_model(args: Dict[str, Any]) -> PreTrainedModel:
     # WARNING: esm and llm weights are fixed
     model.esm_encoder.requires_grad_(False)
     model.llm_decoder.requires_grad_(False)
+
+    # Clean up temporary memory
+    gc.collect()
+    torch.cuda.empty_cache()
 
     return model
 
@@ -401,14 +410,19 @@ def train_epoch(
         # rescale loss for consistency with different gradient accumulation steps
         loss = loss / args["gradient_accumulation_steps"]
 
+        # Single check for impossible batch loss values
+        batch_loss_value = loss.item() * args["gradient_accumulation_steps"]
+        if torch.isnan(loss) or torch.isinf(loss) or batch_loss_value <= 0:
+            print(f"Impossible batch_loss detected at batch {batch_idx}: {batch_loss_value}")
+
         # summary current batch
         t.set_postfix({
             "mode": "train",
             "epoch": f"{current_epoch}/{args['num_epochs']}",
-            "batch_loss": loss.item() * args["gradient_accumulation_steps"],
+            "batch_loss": f"{batch_loss_value:.4f}",
             "device": f"rank:{rank}"
         })
-        ddp_loss[0] += loss.item() * args["gradient_accumulation_steps"]
+        ddp_loss[0] += batch_loss_value
         ddp_loss[1] += 1  # the loss is the weighted mean of the output of every batch
 
         # scale the loss up by a large factor to prevent them from becoming too small
@@ -579,14 +593,21 @@ def train_on_device(
 
     torch.cuda.set_device(rank)
 
-    model = load_model(args=args)
-    model = model.to(rank)
+    # Load model directly to GPU (no .to(rank) needed since model is already on correct device)
+    model = load_model(args=args, device_rank=rank)
+    
+    # Ensure all models are loaded before proceeding with DDP
+    torch.cuda.synchronize()
+    dist.barrier()
 
     model = DistributedDataParallel(
         model, 
         find_unused_parameters=True  # suppress error for unused parameters in wrapped model
     )
-    print(f"DDP model loaded on rank:{rank}")
+    
+    # Final synchronization to ensure DDP is ready on all ranks
+    torch.cuda.synchronize()
+    dist.barrier()
 
     # initialization of the optimizer after wrapping the model
     optimizer = AdamW(
@@ -693,6 +714,13 @@ if __name__ == '__main__':
     # suppress messages from AutoTokenizer parallelism and Graphein respectively
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     os.environ["LOGURU_LEVEL"] = "INFO"
+    
+    # Memory optimization settings
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+    
+    # Initial memory cleanup
+    gc.collect()
+    torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     parsed_args = argParser.parse_args()
     
