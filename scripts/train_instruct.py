@@ -57,7 +57,7 @@ argParser.add_argument("--load_adapter_checkpoint_dir", type=str, default="")
 argParser.add_argument("--load_optimizer_scheduler_checkpoint_path", type=str, default="")
 
 argParser.add_argument("--torch_dtype", type=utils_argparse.str2dtype, default="bfloat16")
-argParser.add_argument("--batch_size_per_device", type=int, default=2)
+argParser.add_argument("--batch_size_per_device", type=int, default=1)
 argParser.add_argument("--num_epochs", type=int, default=24)
 argParser.add_argument("--save_every_epochs", type=int, default=1)
 argParser.add_argument("--gradient_accumulation_steps", type=int, default=32)
