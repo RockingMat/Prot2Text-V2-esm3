@@ -370,7 +370,7 @@ def setup(rank: int, world_size: int):
     os.environ['MASTER_ADDR'] = os.getenv('MASTER_ADDR', 'localhost')
     os.environ['MASTER_PORT'] = os.getenv('MASTER_PORT', '9901')
     # initialize the process group
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size, device_id=rank)
     torch.cuda.set_device(rank)
 
 
