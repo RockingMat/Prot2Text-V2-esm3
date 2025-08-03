@@ -532,7 +532,6 @@ def train_on_device(
     setup(rank, world_size)
 
     # Load model
-    torch.cuda.set_device(rank)
     model = load_model(args=args, device_rank=rank)
     
     # Ensure all models are loaded before proceeding with DDP
